@@ -1,0 +1,10 @@
+# Full environment for this repository.
+# Includes the default research pipeline dependencies plus optional legacy /
+# semantic-similarity components.
+
+-r requirements.txt
+
+# Keep transformers on a torch-2.1/2.2-friendly version. Newer releases use
+# torch.utils._pytree.register_pytree_node and can fail on older torch builds
+# commonly found in AutoDL base images.
+transformers==4.37.2
