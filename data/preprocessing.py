@@ -79,18 +79,15 @@ class MovieLensPreprocessor:
         print("Processing user data...")
 
         # 处理年龄：>35 = 1, <=35 = 0
-        users['age_group'] = (users['age'] > 35).astype('int8')
+        users['age_group'] = (users['age'] > 35).astype('int64')
 
         # 处理性别：M = 0, F = 1
-        users['gender_encoded'] = users['gender'].map({'M': 0, 'F': 1}).astype('int8')
+        users['gender_encoded'] = users['gender'].map({'M': 0, 'F': 1}).astype('int64')
 
         # 创建交叉属性
-        users['gender_age'] = users['gender_encoded'].astype(str) + '_' + users['age_group'].astype(str)
-        users['gender_age_encoded'] = users['gender_age'].astype('category').cat.codes.astype('int8')
 
         print(f"Age distribution: {users['age_group'].value_counts().to_dict()}")
         print(f"Gender distribution: {users['gender'].value_counts().to_dict()}")
-        print(f"Gender-Age distribution: {users['gender_age'].value_counts().to_dict()}")
 
         return users
 
@@ -99,7 +96,7 @@ class MovieLensPreprocessor:
         print("Processing rating data...")
 
         # 评分二值化：>=4 = 1, <4 = 0
-        ratings['binary_rating'] = (ratings['rating'] >= 4).astype('int8')
+        ratings['binary_rating'] = (ratings['rating'] >= 4).astype('int64')
 
         # 只保留正反馈（评分>=4）
         positive_ratings = ratings[ratings['binary_rating'] == 1].copy()
@@ -109,7 +106,7 @@ class MovieLensPreprocessor:
 
         return positive_ratings
 
-    def filter_data(self, ratings, users, movies, min_user_interactions=10, min_item_interactions=5):
+    def filter_data(self, ratings, users, movies, min_user_interactions=5, min_item_interactions=5):
         """过滤数据"""
         print("Filtering data...")
 
@@ -155,7 +152,10 @@ class MovieLensPreprocessor:
         unique_items = sorted(ratings['movie_id'].unique())
 
         user_map = {old_id: new_id for new_id, old_id in enumerate(unique_users)}
-        item_map = {old_id: new_id for new_id, old_id in enumerate(unique_items)}
+        # Reserve item id 0 exclusively for padding / ignore_index.
+        # All real items are mapped to 1..num_items so model targets and
+        # embedding rows stay aligned across full-softmax and sampled eval.
+        item_map = {old_id: new_id for new_id, old_id in enumerate(unique_items, start=1)}
 
         # 应用映射
         ratings['user_id'] = ratings['user_id'].map(user_map)
@@ -221,7 +221,6 @@ class MovieLensPreprocessor:
                     'target': target,
                     'gender': user_info['gender_encoded'],
                     'age_group': user_info['age_group'],
-                    'gender_age': user_info['gender_age_encoded']
                 })
 
             # 验证样本（倒数第2个为目标）
@@ -235,7 +234,6 @@ class MovieLensPreprocessor:
                 'target': val_target,
                 'gender': user_info['gender_encoded'],
                 'age_group': user_info['age_group'],
-                'gender_age': user_info['gender_age_encoded']
             })
 
             # 测试样本（最后1个为目标）
@@ -249,7 +247,6 @@ class MovieLensPreprocessor:
                 'target': test_target,
                 'gender': user_info['gender_encoded'],
                 'age_group': user_info['age_group'],
-                'gender_age': user_info['gender_age_encoded']
             })
 
         print(f"Data split done: Train {len(train_data)}, Val {len(val_data)}, Test {len(test_data)}")
@@ -268,6 +265,7 @@ class MovieLensPreprocessor:
             'movies': movies,
             'user_map': user_map,
             'item_map': item_map,
+            'item_id_start': 1,
             'num_users': len(user_map),
             'num_items': len(item_map)
         }
