@@ -1,0 +1,154 @@
+{
+  "__dataset_backbones__": {
+    "ml-1m": {
+      "sasrec": {
+        "learning_rate": 0.0005,
+        "hidden_units": 64,
+        "dropout_rate": 0.2,
+        "epsilon": 1.0,
+        "augment_ratio": 0.1,
+        "utility_alpha": 0.7,
+        "utility_beta": 0.3,
+        "fair_ncl_align_weight": 0.5,
+        "fair_ncl_var_weight": 1.0,
+        "fair_ncl_cov_weight": 0.04
+      },
+      "bert4rec": {
+        "learning_rate": 0.001,
+        "hidden_units": 128,
+        "dropout_rate": 0.1,
+        "epsilon": 1.0,
+        "augment_ratio": 0.1,
+        "utility_alpha": 0.7,
+        "utility_beta": 0.3,
+        "fair_ncl_align_weight": 1.0,
+        "fair_ncl_var_weight": 1.0,
+        "fair_ncl_cov_weight": 0.04
+      },
+      "gru4rec": {
+        "learning_rate": 0.0005,
+        "hidden_units": 128,
+        "dropout_rate": 0.1,
+        "epsilon": 2.0,
+        "augment_ratio": 0.1,
+        "utility_alpha": 0.7,
+        "utility_beta": 0.3,
+        "fair_ncl_align_weight": 0.5,
+        "fair_ncl_var_weight": 0.5,
+        "fair_ncl_cov_weight": 0.08
+      },
+      "caser": {
+        "learning_rate": 0.001,
+        "hidden_units": 128,
+        "dropout_rate": 0.2,
+        "epsilon": 1.0,
+        "augment_ratio": 0.1,
+        "utility_alpha": 0.6,
+        "utility_beta": 0.4,
+        "fair_ncl_align_weight": 1.0,
+        "fair_ncl_var_weight": 0.5,
+        "fair_ncl_cov_weight": 0.02
+      }
+    },
+	"lastfm-1k": {
+      "sasrec": {
+        "learning_rate": 0.001,
+        "hidden_units": 128,
+        "dropout_rate": 0.1,
+        "epsilon": 0.5,
+        "augment_ratio": 0.1,
+        "utility_alpha": 0.7,
+        "utility_beta": 0.3,
+        "fair_ncl_align_weight": 0.5,
+        "fair_ncl_var_weight": 0.5,
+        "fair_ncl_cov_weight": 0.02
+      },
+      "bert4rec": {
+        "learning_rate": 0.0005,
+        "hidden_units": 128,
+        "dropout_rate": 0.1,
+        "epsilon": 0.5,
+        "augment_ratio": 0.1,
+        "utility_alpha": 0.7,
+        "utility_beta": 0.3,
+        "fair_ncl_align_weight": 1.0,
+        "fair_ncl_var_weight": 1.0,
+        "fair_ncl_cov_weight": 0.04
+      },
+      "gru4rec": {
+        "learning_rate": 0.0005,
+        "hidden_units": 128,
+        "dropout_rate": 0.2,
+        "epsilon": 2.0,
+        "augment_ratio": 0.1,
+        "utility_alpha": 0.7,
+        "utility_beta": 0.3,
+        "fair_ncl_align_weight": 1.0,
+        "fair_ncl_var_weight": 0.5,
+        "fair_ncl_cov_weight": 0.04
+      },
+	  "caser": {
+        "learning_rate": 0.001,
+        "hidden_units": 64,
+        "dropout_rate": 0.2,
+        "epsilon": 1.0,
+        "augment_ratio": 0.1,
+        "utility_alpha": 0.6,
+        "utility_beta": 0.4,
+        "fair_ncl_align_weight": 1.0,
+        "fair_ncl_var_weight": 0.5,
+        "fair_ncl_cov_weight": 0.04
+      }
+    },
+	"taobao": {
+      "sasrec": {
+        "learning_rate": 0.0005,
+        "hidden_units": 64,
+        "dropout_rate": 0.1,
+        "epsilon": 0.5,
+        "augment_ratio": 0.1,
+        "utility_alpha": 0.7,
+        "utility_beta": 0.3,
+        "fair_ncl_align_weight": 0.5,
+        "fair_ncl_var_weight": 0.5,
+        "fair_ncl_cov_weight": 0.02
+      },
+      "bert4rec": {
+        "learning_rate": 0.0005,
+        "hidden_units": 64,
+        "dropout_rate": 0.2,
+        "epsilon": 1.0,
+        "augment_ratio": 0.2,
+        "utility_alpha": 0.7,
+        "utility_beta": 0.3,
+        "fair_ncl_align_weight": 1,
+        "fair_ncl_var_weight": 1,
+        "fair_ncl_cov_weight": 0.04
+      },
+      "gru4rec": {
+        "learning_rate": 0.001,
+        "hidden_units": 128,
+        "dropout_rate": 0.1,
+        "epsilon": 2,
+        "augment_ratio": 0.2,
+        "utility_alpha": 0.6,
+        "utility_beta": 0.4,
+        "fair_ncl_align_weight": 1,
+        "fair_ncl_var_weight": 0.5,
+        "fair_ncl_cov_weight": 0.02
+      },
+      "caser": {
+        "learning_rate": 0.0005,
+        "hidden_units": 128,
+        "dropout_rate": 0.1,
+        "epsilon": 1,
+        "augment_ratio": 0.1,
+        "utility_alpha": 0.6,
+        "utility_beta": 0.4,
+        "fair_ncl_align_weight": 1,
+        "fair_ncl_var_weight": 0.5,
+        "fair_ncl_cov_weight": 0.08
+      }
+    }
+  }
+}

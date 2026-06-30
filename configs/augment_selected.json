@@ -1,0 +1,118 @@
+{
+  "__dataset_backbones__": {
+    "ml-1m": {
+      "sasrec": {
+        "learning_rate": 0.0005,
+        "hidden_units": 64,
+        "dropout_rate": 0.2,
+        "epsilon": 1.0,
+        "augment_ratio": 0.1,
+        "utility_alpha": 0.7,
+        "utility_beta": 0.3
+      },
+      "bert4rec": {
+        "learning_rate": 0.001,
+        "hidden_units": 128,
+        "dropout_rate": 0.1,
+        "epsilon": 1.0,
+        "augment_ratio": 0.1,
+        "utility_alpha": 0.7,
+        "utility_beta": 0.3
+      },
+      "gru4rec": {
+        "learning_rate": 0.0005,
+        "hidden_units": 128,
+        "dropout_rate": 0.1,
+        "epsilon": 2.0,
+        "augment_ratio": 0.1,
+        "utility_alpha": 0.7,
+        "utility_beta": 0.3
+      },
+      "caser": {
+        "learning_rate": 0.001,
+        "hidden_units": 128,
+        "dropout_rate": 0.2,
+        "epsilon": 1.0,
+        "augment_ratio": 0.1,
+        "utility_alpha": 0.6,
+        "utility_beta": 0.4
+      }
+    },
+	"lastfm-1k": {
+      "sasrec": {
+        "learning_rate": 0.001,
+        "hidden_units": 128,
+        "dropout_rate": 0.1,
+        "epsilon": 0.5,
+        "augment_ratio": 0.1,
+        "utility_alpha": 0.7,
+        "utility_beta": 0.3
+      },
+      "bert4rec": {
+        "learning_rate": 0.0005,
+        "hidden_units": 128,
+        "dropout_rate": 0.1,
+        "epsilon": 0.5,
+        "augment_ratio": 0.1,
+        "utility_alpha": 0.7,
+        "utility_beta": 0.3
+      },
+      "gru4rec": {
+        "learning_rate": 0.0005,
+        "hidden_units": 128,
+        "dropout_rate": 0.2,
+        "epsilon": 2.0,
+        "augment_ratio": 0.1,
+        "utility_alpha": 0.7,
+        "utility_beta": 0.3
+      },
+	  "caser": {
+        "learning_rate": 0.001,
+        "hidden_units": 64,
+        "dropout_rate": 0.2,
+        "epsilon": 1.0,
+        "augment_ratio": 0.1,
+        "utility_alpha": 0.7,
+        "utility_beta": 0.3
+      }
+    },
+	"taobao": {
+      "sasrec": {
+        "learning_rate": 0.0005,
+        "hidden_units": 64,
+        "dropout_rate": 0.1,
+        "epsilon": 0.5,
+        "augment_ratio": 0.1,
+        "utility_alpha": 0.7,
+        "utility_beta": 0.3
+      },
+      "bert4rec": {
+        "learning_rate": 0.0005,
+        "hidden_units": 64,
+        "dropout_rate": 0.2,
+        "epsilon": 1.0,
+        "augment_ratio": 0.2,
+        "utility_alpha": 0.7,
+        "utility_beta": 0.3
+      },
+      "gru4rec": {
+        "learning_rate": 0.001,
+        "hidden_units": 128,
+        "dropout_rate": 0.1,
+        "epsilon": 2.0,
+        "augment_ratio": 0.2,
+        "utility_alpha": 0.6,
+        "utility_beta": 0.4
+      },
+      "caser": {
+        "learning_rate": 0.0005,
+        "hidden_units": 128,
+        "dropout_rate": 0.1,
+        "epsilon": 1.0,
+        "augment_ratio": 0.1,
+        "utility_alpha": 0.6,
+        "utility_beta": 0.4
+      }
+    }
+  }
+}
