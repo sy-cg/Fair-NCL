@@ -38,10 +38,9 @@ class BaseRecommenderModel(nn.Module, ABC):
         """预测函数，子类必须实现"""
         pass
 
-    @abstractmethod
     def compute_loss(self, *args, **kwargs):
-        """损失计算，子类必须实现"""
-        pass
+        """损失计算，默认实现，子类可以重写"""
+        raise NotImplementedError("Subclass should implement compute_loss")
 
     def get_user_embeddings(self, user_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -303,8 +302,11 @@ def create_model(model_name: str, config) -> BaseRecommenderModel:
 
     # 如果支持模型编译，进行编译优化
     if hasattr(config, 'use_compile') and config.use_compile and hasattr(torch, 'compile'):
-        model = torch.compile(model, mode='max-autotune')
-        print(f"Model {model_name} compiled for optimization")
+        try:
+            model = torch.compile(model, mode='max-autotune')
+            print(f"Model {model_name} compiled for optimization")
+        except Exception as e:
+            print(f"Model compilation failed: {e}, using uncompiled model")
 
     return model
 
@@ -338,3 +340,37 @@ def get_model_device(model: nn.Module) -> torch.device:
 def move_model_to_device(model: nn.Module, device: torch.device) -> nn.Module:
     """将模型移动到指定设备"""
     return model.to(device)
+
+
+def register_advanced_models():
+    """延迟注册高级模型（AFRL和SM）"""
+    try:
+        # === 修复: 直接导入整个模块，而不是写死具体的类名 ===
+        import models.afrl_model
+        print("AFRL models registered successfully")
+    except ImportError as e:
+        print(f"Warning: Could not import AFRL models: {e}")
+
+    try:
+        # === 修复: 直接导入整个模块 ===
+        import models.sm_models
+        print("SM models registered successfully")
+    except ImportError as e:
+        print(f"Warning: Could not import SM models: {e}")
+
+
+# 在模块级别调用注册函数，但使用延迟导入
+def _lazy_register():
+    """延迟注册函数"""
+    import sys
+    if 'models.afrl_model' not in sys.modules and 'sm_models' not in sys.modules:
+        try:
+            register_advanced_models()
+        except:
+            pass  # 忽略导入错误
+
+
+# 设置模块级别的延迟加载
+import atexit
+
+atexit.register(_lazy_register)

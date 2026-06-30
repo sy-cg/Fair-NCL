@@ -153,7 +153,7 @@ class OptimizedSASRec(BaseSequentialModel):
         positions = positions.unsqueeze(0).expand(batch_size, -1)
 
         # 项目嵌入
-        seq_emb = self.item_emb(input_seq)
+        seq_emb = self.item_emb(input_seq).clone()
         pos_emb = self.pos_emb(positions)
 
         # 添加位置嵌入
@@ -181,7 +181,7 @@ class OptimizedSASRec(BaseSequentialModel):
 
         if candidate_items is None:
             # 预测所有物品
-            item_emb = self.item_emb.weight[1:]  # 排除padding
+            item_emb = self.item_emb.weight
             logits = torch.matmul(last_emb, item_emb.transpose(0, 1))
         else:
             # 预测特定候选物品

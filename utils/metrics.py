@@ -39,7 +39,7 @@ class RecommendationMetrics:
         if targets.ndim == 1:
             targets = targets.unsqueeze(1)
         elif targets.ndim == 2 and targets.size(1) == 0:
-            return {f'{m}@{k}': 0.0 for m in ['Recall', 'Precision', 'NDCG', 'HR', 'MRR'] for k in k_list}
+            return {f'{m}@{k}': 0.0 for m in ['Recall', 'Precision', 'NDCG', 'HitRate', 'MRR'] for k in k_list}
 
         metrics = {}
 
@@ -54,7 +54,7 @@ class RecommendationMetrics:
             metrics[f'NDCG@{k}'] = ndcg_k
 
             hr_k = self._compute_hit_rate_at_k(predictions, targets, k)
-            metrics[f'HR@{k}'] = hr_k
+            metrics[f'HitRate@{k}'] = hr_k
 
             mrr_k = self._compute_mrr_at_k(predictions, targets, k)
             metrics[f'MRR@{k}'] = mrr_k
@@ -133,6 +133,42 @@ class RecommendationMetrics:
             mrr_scores.append(rr)
 
         return np.mean(mrr_scores) if mrr_scores else 0.0
+
+    def _compute_recall_at_k(self, predictions: torch.Tensor,
+                             targets: torch.Tensor, k: int) -> float:
+        """Recall@K with correct handling for one-hot or id targets."""
+        k = min(k, predictions.size(1))
+        _, top_k_indices = torch.topk(predictions, k, dim=1)
+
+        if targets.size(1) == predictions.size(1):
+            rel = torch.gather(targets.float(), 1, top_k_indices)
+            positives = torch.clamp(targets.float().sum(dim=1), min=1.0)
+            values = rel.sum(dim=1) / positives
+        else:
+            values = torch.any(top_k_indices == targets, dim=1).float()
+
+        return torch.mean(values).item()
+
+    def _compute_precision_at_k(self, predictions: torch.Tensor,
+                                targets: torch.Tensor, k: int) -> float:
+        """Precision@K is hit count divided by K, not the hit rate."""
+        k = min(k, predictions.size(1))
+        _, top_k_indices = torch.topk(predictions, k, dim=1)
+
+        if targets.size(1) == predictions.size(1):
+            rel = torch.gather(targets.float(), 1, top_k_indices)
+            values = rel.sum(dim=1) / k
+        else:
+            if targets.size(1) == 1:
+                hits = torch.any(top_k_indices == targets, dim=1).float()
+            else:
+                hits = torch.zeros(predictions.size(0), device=predictions.device)
+                for col in range(targets.size(1)):
+                    hits += torch.any(top_k_indices == targets[:, col:col + 1], dim=1).float()
+                hits = torch.clamp(hits, max=float(k))
+            values = hits / k
+
+        return torch.mean(values).item()
 
 
 class FairnessMetrics:
@@ -235,6 +271,109 @@ class FairnessMetrics:
             'equalized_opportunity': max(0, fairness_score),
             'group_tpr': group_tpr,
             'max_difference': max_diff
+        }
+
+    def compute_group_utility_parity(self,
+                                     predictions: np.ndarray,
+                                     targets: np.ndarray,
+                                     sensitive_attr: np.ndarray,
+                                     k: int = 10) -> Dict[str, float]:
+        """Compute user-side group utility gaps using NDCG@K and HitRate@K."""
+        unique_groups = np.unique(sensitive_attr)
+        if len(unique_groups) < 2:
+            return {
+                'group_utility_parity': 1.0,
+                'group_utility_gap': 0.0,
+                'group_ndcg': {},
+                'group_hit_rate': {}
+            }
+
+        group_ndcg = {}
+        group_hit_rate = {}
+
+        for group in unique_groups:
+            group_mask = (sensitive_attr == group)
+            group_predictions = predictions[group_mask]
+            group_targets = targets[group_mask]
+
+            ndcg_scores = []
+            hit_scores = []
+            for pred, target_vec in zip(group_predictions, group_targets):
+                top_k_items = np.argsort(pred)[-k:][::-1]
+
+                if target_vec.ndim > 0 and target_vec.shape[0] == pred.shape[0]:
+                    positives = np.flatnonzero(target_vec > 0)
+                else:
+                    positives = np.array([int(target_vec)])
+
+                if positives.size == 0:
+                    continue
+
+                hit = 0.0
+                dcg = 0.0
+                for rank, item in enumerate(top_k_items):
+                    if item in positives:
+                        hit = 1.0
+                        dcg += 1.0 / np.log2(rank + 2)
+
+                idcg = sum(1.0 / np.log2(i + 2) for i in range(min(len(positives), k)))
+                ndcg_scores.append(dcg / idcg if idcg > 0 else 0.0)
+                hit_scores.append(hit)
+
+            group_ndcg[int(group)] = float(np.mean(ndcg_scores)) if ndcg_scores else 0.0
+            group_hit_rate[int(group)] = float(np.mean(hit_scores)) if hit_scores else 0.0
+
+        utility_values = list(group_ndcg.values())
+        max_diff = max(utility_values) - min(utility_values) if utility_values else 0.0
+
+        return {
+            'group_utility_parity': max(0.0, 1.0 - max_diff),
+            'group_utility_gap': max_diff,
+            'worst_group_utility': min(utility_values) if utility_values else 0.0,
+            'group_ndcg': group_ndcg,
+            'group_hit_rate': group_hit_rate
+        }
+
+    def compute_demographic_parity(self,
+                                   predictions: np.ndarray,
+                                   sensitive_attr: np.ndarray,
+                                   k: int = 10) -> Dict[str, float]:
+        """Approximate top-k selection parity with sampled candidate ranking.
+
+        In the legacy 1-positive + 99-negative protocol, each user always
+        receives exactly k recommendations, so the naive "received exposure"
+        rate is a constant 1.0 and carries no information. We therefore use the
+        positive item's top-k selection rate as a per-user exposure proxy,
+        which is the only observable selection event in the sampled setting.
+        """
+        unique_groups = np.unique(sensitive_attr)
+        if len(unique_groups) < 2:
+            return {'demographic_parity': 1.0, 'group_rates': {}}
+
+        k = min(k, predictions.shape[1])
+        group_rates = {}
+        for group in unique_groups:
+            group_mask = sensitive_attr == group
+            group_predictions = predictions[group_mask]
+            if len(group_predictions) == 0:
+                continue
+            exposures = np.zeros(len(group_predictions), dtype=np.float32)
+            for index, pred in enumerate(group_predictions):
+                top_k_items = np.argsort(pred)[-k:]
+                exposures[index] = float(0 in top_k_items)
+            group_rates[int(group)] = float(np.mean(exposures)) if exposures.size > 0 else 0.0
+
+        if len(group_rates) < 2:
+            return {'demographic_parity': 1.0, 'group_rates': group_rates}
+
+        rates = list(group_rates.values())
+        max_diff = max(rates) - min(rates)
+        return {
+            'demographic_parity': max(0.0, 1.0 - max_diff),
+            'group_rates': group_rates,
+            'max_difference': max_diff,
+            'statistical_parity_difference': rates[0] - rates[1],
+            'disparate_impact': rates[0] / (rates[1] + 1e-8)
         }
 
     def compute_individual_fairness(self,
@@ -385,13 +524,21 @@ class MetricCalculator:
                 eo_result = fairness_calc.compute_equalized_opportunity(
                     pred_np, targets_np, attr_values, k=k_list[1])
 
+                utility_result = fairness_calc.compute_group_utility_parity(
+                    pred_np, targets_np, attr_values, k=k_list[1])
+
                 fairness_results[attr_name] = {
                     'demographic_parity': dp_result['demographic_parity'],
                     'equalized_opportunity': eo_result['equalized_opportunity'],
+                    'group_utility_parity': utility_result['group_utility_parity'],
+                    'group_utility_gap': utility_result['group_utility_gap'],
+                    'worst_group_utility': utility_result['worst_group_utility'],
                     'statistical_parity_difference': dp_result.get('statistical_parity_difference', np.nan),
                     'disparate_impact': dp_result.get('disparate_impact', np.nan),
                     'group_rates': dp_result['group_rates'],
-                    'group_tpr': eo_result['group_tpr']
+                    'group_tpr': eo_result['group_tpr'],
+                    'group_ndcg': utility_result['group_ndcg'],
+                    'group_hit_rate': utility_result['group_hit_rate']
                 }
 
             results['fairness'] = fairness_results

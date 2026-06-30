@@ -1,269 +1,226 @@
-import torch
-import numpy as np
-import pickle
-import os
+import math
 from collections import defaultdict
+
+import numpy as np
+import torch
 from torch.cuda.amp import autocast
-import torch.nn.functional as F
 
-
-# 在 dp_augmenter.py 中修改 OptimizedDifferentialPrivacyAugmenter 类
 
 class OptimizedDifferentialPrivacyAugmenter:
-    """GPU优化的差分隐私增强器"""
+    """Exponential-mechanism-inspired fairness-aware sequence augmenter.
 
-    def __init__(self, config, fair_synonyms, movie_bias_scores, user_history_dict=None):
+    This is DP-inspired controlled perturbation rather than a full privacy
+    guarantee for the whole recommender pipeline. Sensitive attributes are used
+    only during training to estimate directional item bias and sample local,
+    preference-preserving replacements.
+    """
+
+    def __init__(self, config, fair_synonyms, movie_bias_scores):
         self.config = config
         self.device = config.device
-        self.epsilon = config.epsilon
-        self.fair_synonyms = fair_synonyms
-        self.movie_bias_scores = movie_bias_scores
-        self.sensitivity = 2.0
+        self.epsilon = getattr(config, 'epsilon', 1.0)
+        self.augment_ratio = getattr(config, 'augment_ratio', 0.2)
+        self.alpha = getattr(config, 'utility_alpha', 0.7)
+        self.beta = getattr(config, 'utility_beta', 0.3)
+        self.sensitivity = getattr(config, 'utility_sensitivity', 1.0)
+        self.fair_synonyms = fair_synonyms or {}
+        self.movie_bias_scores = movie_bias_scores or {}
+        self.sensitive_attributes = getattr(config, 'sensitive_attributes', ['gender', 'age_group'])
+        self.attribute_dims = getattr(config, 'attribute_dims', {
+            'gender': 2,
+            'age_group': 2
+        })
 
-        # 添加用户历史数据
-        self.user_history_dict = user_history_dict or {}
+    def augment_batch_optimized(self, batch):
+        with autocast(enabled=getattr(self.config, 'use_mixed_precision', False)):
+            return self._augment_batch_gpu(batch)
 
-        # 添加效用函数权重
-        self.content_weight = config.content_weight
-        self.fairness_weight = config.fairness_weight
-        self.personalization_weight = config.personalization_weight
-
-        self._preprocess_synonyms_for_gpu()
-        self._precompute_bias_tensors()
-        self._precompute_similarity_tensors()
-        self._precompute_user_item_similarities()  # 新增：预计算用户-物品相似度
-
-    def _precompute_user_item_similarities(self):
-        """预计算用户历史物品与候选物品的相似度"""
-        print("Precomputing user-item similarities for personalization...")
-
-        # 加载物品相似度矩阵
-        similarity_path = os.path.join(self.config.processed_data_dir, 'movie_similarities.pkl')
-        if os.path.exists(similarity_path):
-            with open(similarity_path, 'rb') as f:
-                self.item_similarity_dict = pickle.load(f)
-        else:
-            print("Warning: No similarity file found for personalization")
-            self.item_similarity_dict = {}
-
-    def _compute_personalization_score(self, original_movie, candidate_movies, gender, age, user_id=None):
-        """基于用户历史行为计算个性化分数"""
-        num_candidates = len(candidate_movies)
-        personalization_scores = torch.zeros(num_candidates, device=self.device)
-
-        # 如果没有用户ID或历史数据，返回默认分数
-        if user_id is None or user_id not in self.user_history_dict:
-            return torch.ones(num_candidates, device=self.device) * 0.5
-
-        # 获取用户历史物品
-        user_history = self.user_history_dict.get(user_id, set())
-        if not user_history:
-            return torch.ones(num_candidates, device=self.device) * 0.5
-
-        # 计算每个候选物品与用户历史的相似度
-        for i, candidate_idx in enumerate(candidate_movies):
-            candidate_id = self.idx_to_movie.get(candidate_idx.item(), None)
-            if candidate_id is None:
-                continue
-
-            # 计算与历史物品的平均相似度
-            similarities = []
-            for hist_item in user_history:
-                if hist_item in self.item_similarity_dict and candidate_id in self.item_similarity_dict[hist_item]:
-                    sim = self.item_similarity_dict[hist_item].get(candidate_id, 0.0)
-                    similarities.append(sim)
-
-            if similarities:
-                # 使用平均相似度作为个性化分数
-                personalization_scores[i] = np.mean(similarities)
-            else:
-                personalization_scores[i] = 0.3  # 默认较低分数
-
-        # 归一化分数到 [0, 1]
-        if personalization_scores.max() > personalization_scores.min():
-            personalization_scores = (personalization_scores - personalization_scores.min()) / (
-                    personalization_scores.max() - personalization_scores.min()
-            )
-
-        return personalization_scores
+    def augment_batch(self, batch):
+        return self._augment_batch_gpu(batch)
 
     def _augment_batch_gpu(self, batch):
-        input_seq = batch['input_seq'].clone()
-        gender = batch['gender'].squeeze(-1)
-        age = batch['age_group'].squeeze(-1)
-        user_ids = batch.get('user_id', None)  # 获取用户ID
-        mask = input_seq > 0
-        lengths = mask.sum(dim=1)
+        if not self.fair_synonyms:
+            return batch
 
-        raw_num_aug = (lengths.float() * self.config.augment_ratio).long()
+        input_seq = batch['input_seq'].clone()
+        valid_mask = input_seq > 0
+        lengths = valid_mask.sum(dim=1)
+
+        raw_num_aug = (lengths.float() * self.augment_ratio).long()
         num_aug = torch.maximum(torch.ones_like(raw_num_aug), torch.minimum(raw_num_aug, lengths))
 
-        for i in range(input_seq.size(0)):
-            pos = torch.nonzero(mask[i]).squeeze(-1)
-            if len(pos) == 0:
+        for row in range(input_seq.size(0)):
+            positions = torch.nonzero(valid_mask[row], as_tuple=False).squeeze(-1)
+            if positions.numel() == 0:
                 continue
-            sel = pos[torch.randperm(len(pos), device=self.device)[:num_aug[i]]]
-            original_ids = input_seq[i, sel]
 
-            # 传递用户ID
-            user_id = user_ids[i].item() if user_ids is not None else None
-            replaced_ids = self._dp_replace_movies_batch(
-                original_ids, gender[i], age[i], user_id=user_id
-            )
-            input_seq[i, sel] = replaced_ids
+            selected = positions[torch.randperm(positions.numel(), device=input_seq.device)[:num_aug[row]]]
+            for pos in selected:
+                original_item = int(input_seq[row, pos].item())
+                replacement = self._sample_replacement(original_item, batch, row)
+                input_seq[row, pos] = replacement
 
         new_batch = batch.copy()
         new_batch['input_seq'] = input_seq
         return new_batch
 
-    def _dp_replace_movies_batch(self, movie_ids, gender, age, user_id=None):
-        """增强的差分隐私电影替换，支持基于用户历史的个性化"""
-        replaced = []
+    def _sample_replacement(self, original_item, batch, row):
+        candidate_ids, similarities = self._candidate_ids_and_similarities(original_item)
+        if not candidate_ids:
+            return original_item
 
-        for movie_id in movie_ids:
-            if movie_id.item() not in self.movie_to_idx:
-                replaced.append(movie_id)
-                continue
+        original_bias = self._directional_bias(original_item, batch, row)
+        utilities = []
 
-            midx = self.movie_to_idx[movie_id.item()]
-            synonyms = self.synonym_matrix[midx]
-            valid_mask = synonyms >= 0
-            valid = synonyms[valid_mask]
+        for candidate, similarity in zip(candidate_ids, similarities):
+            candidate_bias = self._directional_bias(candidate, batch, row)
+            fairness_gain = max(0.0, original_bias - candidate_bias)
+            utility = self.alpha * similarity + self.beta * fairness_gain
+            utilities.append(max(0.0, min(1.0, utility)))
 
-            if len(valid) == 0:
-                replaced.append(movie_id)
-                continue
+        utilities = torch.tensor(utilities, dtype=torch.float32, device=self.device)
+        scaled = self.epsilon * utilities / (2.0 * max(self.sensitivity, 1e-8))
+        probs = torch.softmax(scaled, dim=0)
+        sampled_idx = torch.multinomial(probs, 1).item()
+        return int(candidate_ids[sampled_idx])
 
-            # 1. 计算内容相似度分数
-            content_similarities = self.similarity_tensor[midx][valid_mask]
+    def _candidate_ids_and_similarities(self, item_id):
+        candidates = self.fair_synonyms.get(item_id, [])
 
-            # 2. 计算公平性分数
-            g_bias = self.gender_bias_tensor[valid, gender]
-            a_bias = self.age_bias_tensor[valid, age]
-            fairness = torch.clamp(1.0 - 0.5 * g_bias - 0.5 * a_bias, min=0.0)
-
-            # 3. 计算个性化分数（基于用户历史）
-            personalization = self._compute_personalization_score(
-                movie_id, valid, gender, age, user_id
-            )
-
-            # 4. 组合效用函数
-            utility = (self.content_weight * content_similarities +
-                       self.fairness_weight * fairness +
-                       self.personalization_weight * personalization)
-
-            # 5. 应用差分隐私机制
-            scaled_utility = self.epsilon * utility / (2 * self.sensitivity)
-            probs = torch.exp(scaled_utility - scaled_utility.max())
-            probs /= probs.sum()
-
-            # 6. 采样
-            sampled_idx = torch.multinomial(probs, 1).item()
-            replaced.append(valid[sampled_idx])
-
-        return torch.tensor(replaced, device=self.device)
-
-    def _preprocess_synonyms_for_gpu(self):
-        print("Preprocessing synonyms for GPU...")
-        all_movies = set(self.fair_synonyms.keys())
-        for synonyms_list in self.fair_synonyms.values():
-            all_movies.update(synonyms_list)
-        self.movie_to_idx = {movie: idx for idx, movie in enumerate(sorted(all_movies))}
-        self.idx_to_movie = {idx: movie for movie, idx in self.movie_to_idx.items()}
-
-        max_synonyms = max(len(synonyms) for synonyms in self.fair_synonyms.values()) if self.fair_synonyms else 0
-        self.synonym_matrix = torch.full(
-            (len(all_movies), max_synonyms), -1, dtype=torch.long, device=self.device
-        )
-        for movie, synonyms in self.fair_synonyms.items():
-            if movie in self.movie_to_idx:
-                movie_idx = self.movie_to_idx[movie]
-                for i, synonym in enumerate(synonyms):
-                    if synonym in self.movie_to_idx:
-                        self.synonym_matrix[movie_idx, i] = self.movie_to_idx[synonym]
-
-    def _precompute_bias_tensors(self):
-        print("Precomputing bias tensors...")
-        num_movies = len(self.movie_to_idx)
-        self.gender_bias_tensor = torch.zeros(num_movies, 2, device=self.device)
-        self.age_bias_tensor = torch.zeros(num_movies, 2, device=self.device)
-        for movie, bias_info in self.movie_bias_scores.items():
-            if movie in self.movie_to_idx:
-                movie_idx = self.movie_to_idx[movie]
-                self.gender_bias_tensor[movie_idx, 0] = bias_info.get('male_bias', 0)
-                self.gender_bias_tensor[movie_idx, 1] = bias_info.get('female_bias', 0)
-                self.age_bias_tensor[movie_idx, 0] = bias_info.get('age_0_bias', 0)
-                self.age_bias_tensor[movie_idx, 1] = bias_info.get('age_1_bias', 0)
-
-    def augment_batch_optimized(self, batch):
-        with autocast(enabled=self.config.use_mixed_precision):
-            return self._augment_batch_gpu(batch)
-
-
-    def _precompute_similarity_tensors(self):
-        """预计算同义词的内容相似度"""
-        print("Precomputing similarity tensors...")
-
-        # 加载相似度矩阵
-        similarity_path = os.path.join(self.config.processed_data_dir, 'movie_similarities.pkl')
-        if os.path.exists(similarity_path):
-            with open(similarity_path, 'rb') as f:
-                similarity_dict = pickle.load(f)
+        if isinstance(candidates, dict):
+            ids = [int(k) for k in candidates.keys()]
+            sims = [float(v) for v in candidates.values()]
         else:
-            # 如果没有相似度文件，使用默认值
-            print("Warning: No similarity file found, using default similarity values")
-            similarity_dict = {}
+            ids = [int(x) for x in candidates]
+            sims = [1.0 for _ in ids]
 
-        # 创建相似度张量
-        num_movies = len(self.movie_to_idx)
-        max_synonyms = self.synonym_matrix.shape[1]
-        self.similarity_tensor = torch.zeros(num_movies, max_synonyms, device=self.device)
+        filtered_ids = []
+        filtered_sims = []
+        for candidate_id, sim in zip(ids, sims):
+            if candidate_id > 0 and candidate_id != item_id:
+                filtered_ids.append(candidate_id)
+                filtered_sims.append(max(0.0, min(1.0, sim)))
 
-        for movie, synonyms in self.fair_synonyms.items():
-            if movie in self.movie_to_idx:
-                movie_idx = self.movie_to_idx[movie]
-                for i, synonym in enumerate(synonyms):
-                    if synonym in self.movie_to_idx and movie in similarity_dict:
-                        sim_value = similarity_dict[movie].get(synonym, 0.5)
-                        self.similarity_tensor[movie_idx, i] = sim_value
+        return filtered_ids, filtered_sims
+
+    def _directional_bias(self, item_id, batch, row):
+        info = self.movie_bias_scores.get(int(item_id))
+        if not info:
+            return 0.0
+
+        group_probs = info.get('group_probs', {})
+        values = []
+
+        for attr in self.sensitive_attributes:
+            if attr not in batch or attr not in group_probs:
+                continue
+
+            label = int(batch[attr][row].item())
+            probs = group_probs[attr]
+            if label < 0 or label >= len(probs):
+                continue
+
+            own_prob = probs[label]
+            others = [p for idx, p in enumerate(probs) if idx != label]
+            other_prob = float(np.mean(others)) if others else 0.0
+            values.append(max(0.0, own_prob - other_prob))
+
+        return float(np.mean(values)) if values else 0.0
 
 
 def compute_movie_bias_scores_optimized(train_data, users, movies, config):
-    print("Computing movie bias scores with GPU optimization...")
-    movie_ids, genders, age_groups = [], [], []
-    for s in train_data:
-        movie_ids.append(s['target'])
-        genders.append(s['gender'])
-        age_groups.append(s['age_group'])
+    """Estimate item directional bias from training interactions only."""
+    print("Computing item directional bias scores from training data...")
 
-    movie_tensor = torch.LongTensor(movie_ids).to(config.device)
-    gender_tensor = torch.LongTensor(genders).to(config.device)
-    age_tensor = torch.LongTensor(age_groups).to(config.device)
+    sensitive_attributes = getattr(config, 'sensitive_attributes', ['gender', 'age_group'])
+    attribute_dims = getattr(config, 'attribute_dims', {
+        'gender': 2,
+        'age_group': 2
+    })
 
-    unique_movies = torch.unique(movie_tensor)
+    counts = defaultdict(lambda: {
+        attr: np.zeros(attribute_dims[attr], dtype=np.float64)
+        for attr in sensitive_attributes
+        if attr in attribute_dims
+    })
+    totals = defaultdict(int)
+
+    for sample in train_data:
+        item = int(sample['target'])
+        if item <= 0:
+            continue
+        totals[item] += 1
+        for attr in sensitive_attributes:
+            if attr not in sample or attr not in attribute_dims:
+                continue
+            label = int(sample[attr])
+            if 0 <= label < attribute_dims[attr]:
+                counts[item][attr][label] += 1.0
+
+    min_count = getattr(config, 'bias_min_count', 5)
+    smoothing = getattr(config, 'bias_smoothing', 1.0)
     bias_scores = {}
 
-    with autocast(enabled=config.use_mixed_precision):
-        for movie_id in unique_movies:
-            mask = (movie_tensor == movie_id)
-            count = mask.sum().item()
-            if count < 10:
-                continue
-            g = gender_tensor[mask]
-            a = age_tensor[mask]
-            m, f = (g == 0).sum().item(), (g == 1).sum().item()
-            y, o = (a == 0).sum().item(), (a == 1).sum().item()
-            mr, fr = m / count, f / count
-            yr, or_ = y / count, o / count
-            bias_scores[movie_id.item()] = {
-                'male_bias': max(0, mr - fr),
-                'female_bias': max(0, fr - mr),
-                'age_0_bias': max(0, yr - or_),
-                'age_1_bias': max(0, or_ - yr),
-                'gender_bias': abs(mr - fr),
-                'age_bias': abs(yr - or_),
-                'total_bias': abs(mr - fr) + abs(yr - or_)
-            }
+    for item, total in totals.items():
+        if total < min_count:
+            continue
 
-    print(f"Computed bias scores for {len(bias_scores)} movies")
+        group_probs = {}
+        attr_bias_values = []
+        for attr, attr_counts in counts[item].items():
+            smoothed = attr_counts + smoothing
+            probs = smoothed / smoothed.sum()
+            group_probs[attr] = probs.tolist()
+
+            if len(probs) > 1:
+                attr_bias_values.append(float(probs.max() - probs.min()))
+
+        bias_scores[item] = {
+            'group_probs': group_probs,
+            'total_bias': float(np.mean(attr_bias_values)) if attr_bias_values else 0.0,
+            'count': total
+        }
+
+    print(f"Computed directional bias scores for {len(bias_scores)} items")
     return bias_scores
+
+
+def build_genre_similarity_candidates(movies, config):
+    """Build lightweight item candidates from MovieLens genre overlap."""
+    print("Building genre-based item similarity candidates...")
+
+    top_k = getattr(config, 'k_synonyms', 20)
+    threshold = getattr(config, 'similarity_threshold', 0.2)
+
+    item_genres = {}
+    for _, row in movies.iterrows():
+        item_id = int(row['movie_id'])
+        genres = set(str(row.get('genres', '')).split('|'))
+        genres.discard('')
+        item_genres[item_id] = genres
+
+    candidates = {}
+    item_ids = sorted(item_genres.keys())
+
+    for item_id in item_ids:
+        sims = []
+        genres = item_genres[item_id]
+        if not genres:
+            continue
+
+        for other_id in item_ids:
+            if other_id == item_id:
+                continue
+            other_genres = item_genres[other_id]
+            union = genres | other_genres
+            if not union:
+                continue
+            sim = len(genres & other_genres) / len(union)
+            if sim >= threshold:
+                sims.append((other_id, sim))
+
+        sims.sort(key=lambda x: x[1], reverse=True)
+        candidates[item_id] = {other_id: sim for other_id, sim in sims[:top_k]}
+
+    print(f"Built candidates for {len(candidates)} items")
+    return candidates

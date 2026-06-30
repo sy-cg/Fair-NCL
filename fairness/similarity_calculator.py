@@ -7,7 +7,7 @@ import os
 from tqdm import tqdm
 from torch.cuda.amp import autocast
 import gc
-from pathlib import Path
+
 
 class OptimizedE5SimilarityCalculator:
     """GPU优化的E5相似度计算器"""
@@ -16,17 +16,14 @@ class OptimizedE5SimilarityCalculator:
         self.config = config
         self.device = config.device
 
-        model_path = Path(config.model_cache_dir)/config.e5_model_name
-        model_path = model_path.as_posix()
-
         # 初始化模型和分词器
         print("Loading E5 model...")
         self.tokenizer = AutoTokenizer.from_pretrained(
-            model_path,
+            os.path.join(config.model_cache_dir, config.e5_model_name),
             local_files_only=True
         )
         self.model = AutoModel.from_pretrained(
-            model_path,
+            os.path.join(config.model_cache_dir, config.e5_model_name),
             local_files_only=True
         )
 
