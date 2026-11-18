@@ -1,6 +1,6 @@
 import itertools
 import random
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -13,6 +13,7 @@ from models.afrl_components import (
     DebiasedCollaborativeEncoder,
 )
 from .augmentations import SequenceAugmenter
+from .mce import mce_non_contrastive_losses
 from .common import (
     active_sensitive_attributes,
     collect_sensitive_labels,
@@ -86,8 +87,19 @@ class NCLMethod(BackboneMethod):
         self.align_weight = getattr(config, "fair_ncl_align_weight", 1.0)
         self.var_weight = getattr(config, "fair_ncl_var_weight", 1.0)
         self.cov_weight = getattr(config, "fair_ncl_cov_weight", 0.04)
+        self.ncl_objective = str(getattr(config, "ncl_objective", "vicreg")).lower()
+        self.mce_uniform_weight = getattr(config, "mce_uniform_weight", 1.0)
+        self.mce_align_weight = getattr(config, "mce_align_weight", 1.0)
+        self.mce_gamma = getattr(config, "mce_gamma", 1.0)
+        self.mce_eps = getattr(config, "mce_eps", 1e-4)
 
     def compute_loss(self, batch: Dict) -> Dict[str, torch.Tensor]:
+        if self.ncl_objective == "mce":
+            with _autocast_disabled_for_tensor(batch["input_seq"]):
+                return self._compute_loss(batch)
+        return self._compute_loss(batch)
+
+    def _compute_loss(self, batch: Dict) -> Dict[str, torch.Tensor]:
         input_seq = batch["input_seq"]
         target = batch["target"]
         aug_seq = self.augmenter.augment(input_seq)
@@ -99,20 +111,53 @@ class NCLMethod(BackboneMethod):
 
         rec_loss = recommendation_ce_loss(logits, target)
         aug_rec_loss = recommendation_ce_loss(logits_aug, target)
-        ncl_losses = non_contrastive_losses(z, z_aug)
-        loss = (
-            rec_loss
-            + self.aug_rec_weight * aug_rec_loss
-            + self.align_weight * ncl_losses["align_loss"]
-            + self.var_weight * ncl_losses["var_loss"]
-            + self.cov_weight * ncl_losses["cov_loss"]
-        )
+        if self.ncl_objective == "vicreg":
+            ncl_losses = non_contrastive_losses(z, z_aug)
+            geometry_loss = (
+                self.align_weight * ncl_losses["align_loss"]
+                + self.var_weight * ncl_losses["var_loss"]
+                + self.cov_weight * ncl_losses["cov_loss"]
+            )
+        elif self.ncl_objective == "mce":
+            ncl_losses = mce_non_contrastive_losses(
+                z,
+                z_aug,
+                gamma=self.mce_gamma,
+                eps=self.mce_eps,
+            )
+            geometry_loss = (
+                self.mce_uniform_weight * ncl_losses["mce_uniform_loss"]
+                + self.mce_align_weight * ncl_losses["mce_align_loss"]
+            )
+        else:
+            raise ValueError(f"Unknown non-contrastive objective: {self.ncl_objective}")
+
+        loss = rec_loss + self.aug_rec_weight * aug_rec_loss + geometry_loss
         return {
             "loss": loss,
             "rec_loss": rec_loss,
             "aug_rec_loss": aug_rec_loss,
             **ncl_losses,
         }
+
+
+def _autocast_disabled_for_tensor(tensor: torch.Tensor):
+    import contextlib
+
+    device_type = getattr(getattr(tensor, "device", None), "type", "cuda")
+    amp_autocast = getattr(getattr(torch, "amp", None), "autocast", None)
+    if amp_autocast is not None:
+        return amp_autocast(device_type=device_type, enabled=False)
+
+    cuda_amp_autocast = getattr(
+        getattr(getattr(torch, "cuda", None), "amp", None),
+        "autocast",
+        None,
+    )
+    if device_type == "cuda" and cuda_amp_autocast is not None:
+        return cuda_amp_autocast(enabled=False)
+
+    return contextlib.nullcontext()
 
 
 def _collect_optimizer_params(modules) -> List[torch.nn.Parameter]:
@@ -659,6 +704,17 @@ class AFSRMethod(BackboneMethod):
             seq_output = seq_output[0]
         return seq_output
 
+    @staticmethod
+    def _candidate_id(raw_candidate: Any) -> Optional[int]:
+        if isinstance(raw_candidate, dict):
+            raw_candidate = raw_candidate.get("candidate", raw_candidate.get("item", raw_candidate.get("id")))
+        elif isinstance(raw_candidate, (tuple, list)) and raw_candidate:
+            raw_candidate = raw_candidate[0]
+        try:
+            return int(raw_candidate)
+        except (TypeError, ValueError):
+            return None
+
     def _identify_stereotypical_positions(self, input_seq: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         seq_output = self._sequence_outputs(input_seq)
         if seq_output.dim() != 3:
@@ -685,7 +741,9 @@ class AFSRMethod(BackboneMethod):
             next_frontier = []
             for current in frontier:
                 for cand in self.similarity_candidates.get(current, []):
-                    cand = int(cand)
+                    cand = self._candidate_id(cand)
+                    if cand is None:
+                        continue
                     if cand <= 0 or cand > self.num_items or cand in visited:
                         continue
                     visited.add(cand)

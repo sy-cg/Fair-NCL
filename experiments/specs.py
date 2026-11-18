@@ -9,6 +9,12 @@ from .job_utils import merge_nested_params, merge_params, stable_job_id
 
 
 DATASETS = ("ml-1m", "lastfm-1k", "taobao")
+REVISION_DATASETS = ("ml-1m", "taobao")
+FINAL_REVISION_SEEDS = (42, 2025, 2026, 2027, 2028)
+SELECTION_SEEDS = (42, 2025, 2026)
+FAIR_NCL_AUDIT_EPSILON_GRID = (0.5, 1.0, 2.0)
+FAIR_NCL_AUDIT_BETA_GRID = (0.2, 0.3, 0.4)
+MCE_STABILITY_WEIGHT_GRID = (0.01, 0.05, 0.1, 0.25)
 BACKBONES = ("sasrec", "bert4rec", "gru4rec", "caser")
 LEGACY_ABLATION_METHODS = ("baseline", "fair_ncl", "ncl_only", "random_aug", "similarity_aug")
 REQUESTED_ABLATION_METHODS = (
@@ -57,7 +63,39 @@ COMPARISON_METHODS = (
     "pfrec",
     "a_fsr",
 )
-PHASES = ("backbone", "augment", "loss", "ablation", "comparison", "all")
+SUPPLEMENTARY_DIRECT_METHODS = (
+    "baseline",
+    "fair_ncl",
+    "ncl_only",
+    "random_aug",
+    "similarity_aug",
+    "ncl_sr_mce",
+)
+SUPPLEMENTARY_FAIRNESS_METHODS = COMPARISON_METHODS[2:]
+SUPPLEMENTARY_CLOSEST_METHODS = ("fair_aug_mce",)
+SUPPLEMENTARY_FACTORIAL_METHODS = (
+    "skew_only_aug",
+    "fair_aug_no_geometry",
+    "fair_aug_no_augmented_ce",
+    "raw_skew_fair_ncl",
+)
+VALIDATION_AUDIT_METHODS = (
+    ("fair_ncl",)
+    + SUPPLEMENTARY_FAIRNESS_METHODS
+    + ("ncl_sr_mce", "fair_aug_mce")
+)
+PHASES = (
+    "backbone",
+    "augment",
+    "loss",
+    "ablation",
+    "comparison",
+    "supplementary",
+    "validation_reference",
+    "validation_audit",
+    "mce_stability",
+    "all",
+)
 BACKBONE_TUNING_DATASETS = DATASETS
 BACKBONE_TUNING_BACKBONES = BACKBONES
 AUGMENT_TUNING_DATASETS = DATASETS
@@ -72,8 +110,19 @@ SCOPED_DEFAULT_KEY = "__default__"
 SCOPED_BACKBONES_KEY = "__backbones__"
 SCOPED_DATASETS_KEY = "__datasets__"
 SCOPED_DATASET_BACKBONES_KEY = "__dataset_backbones__"
+SCOPED_METHODS_KEY = "__methods__"
 
-BASE_PARAMS_REQUIRED_PHASES = {"augment", "loss", "ablation", "comparison", "all"}
+BASE_PARAMS_REQUIRED_PHASES = {
+    "augment",
+    "loss",
+    "ablation",
+    "comparison",
+    "supplementary",
+    "validation_reference",
+    "validation_audit",
+    "mce_stability",
+    "all",
+}
 BACKBONE_STAGE_KEYS = ("learning_rate", "hidden_units", "dropout_rate")
 AUGMENT_STAGE_KEYS = BACKBONE_STAGE_KEYS + ("epsilon", "augment_ratio", "utility_alpha", "utility_beta")
 
@@ -93,12 +142,20 @@ class ExperimentJob:
 def build_experiment_plan(phase: str,
                           datasets: Optional[Iterable[str]] = None,
                           backbones: Optional[Iterable[str]] = None,
-                          seeds: Iterable[int] = (42,),
+                          seeds: Optional[Iterable[int]] = None,
                           base_params: Optional[Dict[str, Any]] = None,
                           pairs: Optional[Iterable[str]] = None,
                           ablation_methods: Optional[Iterable[str]] = None) -> List[ExperimentJob]:
     phase = phase.lower()
     base_params = dict(base_params or {})
+    if seeds is None:
+        if phase == "supplementary":
+            seeds = FINAL_REVISION_SEEDS
+        elif phase in {"validation_reference", "validation_audit"}:
+            seeds = SELECTION_SEEDS
+        else:
+            seeds = (42,)
+    seeds = tuple(int(seed) for seed in seeds)
 
     if phase == "backbone":
         datasets, backbones = _resolve_scope(phase, datasets, backbones)
@@ -128,6 +185,22 @@ def build_experiment_plan(phase: str,
         datasets, backbones = _resolve_scope(phase, datasets, backbones)
         _require_base_params(phase, base_params)
         return _comparison_plan(_resolve_pairs(pairs, datasets, backbones), seeds, base_params)
+    if phase == "supplementary":
+        datasets, backbones = _resolve_scope(phase, datasets, backbones)
+        _require_base_params(phase, base_params)
+        return _supplementary_plan(_resolve_pairs(pairs, datasets, backbones), seeds, base_params)
+    if phase == "validation_reference":
+        datasets, backbones = _resolve_scope(phase, datasets, backbones)
+        _require_base_params(phase, base_params)
+        return _validation_reference_plan(_resolve_pairs(pairs, datasets, backbones), seeds, base_params)
+    if phase == "validation_audit":
+        datasets, backbones = _resolve_scope(phase, datasets, backbones)
+        _require_base_params(phase, base_params)
+        return _validation_audit_plan(_resolve_pairs(pairs, datasets, backbones), seeds, base_params)
+    if phase == "mce_stability":
+        datasets, backbones = _resolve_scope(phase, datasets, backbones)
+        _require_base_params(phase, base_params)
+        return _mce_stability_plan(_resolve_pairs(pairs, datasets, backbones), seeds, base_params)
     if phase == "all":
         _require_base_params(phase, base_params)
         jobs = []
@@ -142,7 +215,7 @@ def build_experiment_plan(phase: str,
                 ablation_methods=ablation_methods,
             ))
         return jobs
-    raise ValueError("phase must be one of backbone, augment, loss, ablation, comparison, all")
+    raise ValueError(f"phase must be one of {', '.join(PHASES)}")
 
 
 def _backbone_plan(pairs, seeds):
@@ -212,6 +285,202 @@ def _comparison_plan(pairs, seeds, base_params):
     return jobs
 
 
+def _supplementary_plan(pairs, seeds, base_params):
+    jobs: List[ExperimentJob] = []
+    for dataset, backbone in pairs:
+        methods = list(SUPPLEMENTARY_DIRECT_METHODS + SUPPLEMENTARY_FAIRNESS_METHODS)
+        if backbone in {"sasrec", "bert4rec"}:
+            methods.extend(SUPPLEMENTARY_CLOSEST_METHODS)
+        if backbone == "sasrec":
+            methods.extend(SUPPLEMENTARY_FACTORIAL_METHODS)
+
+        for seed, method in itertools.product(seeds, methods):
+            resolved_base_params = _resolve_method_params(base_params, dataset, backbone, method)
+            params = _supplementary_params(method, resolved_base_params)
+            jobs.append(_make_job("supplementary", dataset, method, backbone, seed, params))
+    return jobs
+
+
+def _validation_audit_plan(pairs, seeds, base_params):
+    jobs: List[ExperimentJob] = []
+    for dataset, backbone in pairs:
+        methods = [
+            method
+            for method in VALIDATION_AUDIT_METHODS
+            if method != "fair_aug_mce" or backbone in {"sasrec", "bert4rec"}
+        ]
+        for method in methods:
+            resolved_base_params = _resolve_method_params(base_params, dataset, backbone, method)
+            for candidate_params in _validation_audit_candidates(method, resolved_base_params):
+                for seed in seeds:
+                    jobs.append(_make_job(
+                        "validation_audit",
+                        dataset,
+                        method,
+                        backbone,
+                        seed,
+                        candidate_params,
+                    ))
+    return jobs
+
+
+def _validation_reference_plan(pairs, seeds, base_params):
+    jobs: List[ExperimentJob] = []
+    for (dataset, backbone), seed in itertools.product(pairs, seeds):
+        params = _resolve_base_params(base_params, dataset, backbone)
+        params["export_per_user_metrics"] = False
+        params["report_intersectional_groups"] = True
+        params["evaluate_test"] = False
+        params["export_mechanism_analysis"] = False
+        jobs.append(_make_job("validation_reference", dataset, "baseline", backbone, seed, params))
+    return jobs
+
+
+def _mce_stability_plan(pairs, seeds, base_params):
+    jobs: List[ExperimentJob] = []
+    for (dataset, backbone), seed, weight in itertools.product(
+        pairs,
+        seeds,
+        MCE_STABILITY_WEIGHT_GRID,
+    ):
+        resolved_base_params = _resolve_method_params(
+            base_params,
+            dataset,
+            backbone,
+            "ncl_sr_mce",
+        )
+        params = _supplementary_params("ncl_sr_mce", resolved_base_params)
+        params.update({
+            "mce_uniform_weight": weight,
+            "mce_align_weight": weight,
+            "mce_diagnostic": True,
+            "evaluate_test": False,
+            "export_per_user_metrics": False,
+            "export_mechanism_analysis": False,
+        })
+        jobs.append(_make_job(
+            "mce_stability",
+            dataset,
+            "ncl_sr_mce",
+            backbone,
+            seed,
+            params,
+        ))
+    return jobs
+
+
+def _supplementary_params(method: str, base_params: Dict[str, Any]) -> Dict[str, Any]:
+    params = dict(base_params)
+    params["evaluate_test"] = True
+    params["export_per_user_metrics"] = True
+    params["report_intersectional_groups"] = True
+    if method in SUPPLEMENTARY_FAIRNESS_METHODS:
+        return _comparison_params(method, params)
+
+    if method in {"fair_ncl", "fair_aug_mce", "fair_aug_no_geometry", "fair_aug_no_augmented_ce"}:
+        params = _final_fair_ncl_params(params)
+        params["bias_metric"] = "prior_jsd"
+        params["bias_event_source"] = "unique_train_events"
+    if method == "fair_aug_mce":
+        params["ncl_objective"] = "mce"
+    elif method == "fair_aug_no_geometry":
+        params["fair_ncl_align_weight"] = 0.0
+        params["fair_ncl_var_weight"] = 0.0
+        params["fair_ncl_cov_weight"] = 0.0
+    elif method == "fair_aug_no_augmented_ce":
+        params["fair_ncl_aug_rec_weight"] = 0.0
+    elif method == "skew_only_aug":
+        params["utility_alpha"] = 0.0
+        params["utility_beta"] = 1.0
+        params["use_similarity_scores"] = False
+        params["similarity_source"] = "cooccurrence"
+        params["bias_metric"] = "prior_jsd"
+        params["bias_event_source"] = "unique_train_events"
+    elif method == "raw_skew_fair_ncl":
+        params = _final_fair_ncl_params(params)
+        params["bias_metric"] = "raw_range"
+        params["bias_event_source"] = "prefix_samples"
+        params["bias_min_count"] = 1
+    elif method == "ncl_sr_mce":
+        params["ncl_objective"] = "mce"
+        params["fair_ncl_aug_rec_weight"] = 0.0
+        params["utility_alpha"] = 1.0
+        params["utility_beta"] = 0.0
+        params["use_similarity_scores"] = True
+        params["similarity_source"] = "semantic_hybrid"
+    elif method == "ncl_only":
+        params["fair_ncl_aug_rec_weight"] = 0.0
+    return params
+
+
+def _validation_audit_candidates(method: str, base_params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    params = _supplementary_params(method, base_params)
+    params["export_per_user_metrics"] = False
+    params["evaluate_test"] = False
+    params["export_mechanism_analysis"] = False
+    candidates = [dict(params)]
+
+    if method == "fair_ncl":
+        beta = float(params.get("utility_beta", 0.3))
+        epsilon = float(params.get("epsilon", 1.0))
+        if beta not in FAIR_NCL_AUDIT_BETA_GRID:
+            raise ValueError(
+                f"Fair-NCL audit center utility_beta={beta} is outside the declared grid "
+                f"{FAIR_NCL_AUDIT_BETA_GRID}."
+            )
+        if epsilon not in FAIR_NCL_AUDIT_EPSILON_GRID:
+            raise ValueError(
+                f"Fair-NCL audit center epsilon={epsilon} is outside the declared grid "
+                f"{FAIR_NCL_AUDIT_EPSILON_GRID}."
+            )
+        for candidate_beta in FAIR_NCL_AUDIT_BETA_GRID:
+            if candidate_beta == beta:
+                continue
+            candidate = dict(params)
+            candidate["utility_beta"] = candidate_beta
+            candidate["utility_alpha"] = 1.0 - candidate_beta
+            candidates.append(candidate)
+        for candidate_epsilon in FAIR_NCL_AUDIT_EPSILON_GRID:
+            if candidate_epsilon == epsilon:
+                continue
+            candidate = dict(params)
+            candidate["epsilon"] = candidate_epsilon
+            candidates.append(candidate)
+    elif method in {"ncl_sr_mce", "fair_aug_mce"}:
+        uniform_weight = float(params.get("mce_uniform_weight", 1.0))
+        align_weight = float(params.get("mce_align_weight", 1.0))
+        for uniform_multiplier, align_multiplier in (
+            (0.5, 1.0),
+            (2.0, 1.0),
+            (1.0, 0.5),
+            (1.0, 2.0),
+        ):
+            candidate = dict(params)
+            candidate["mce_uniform_weight"] = uniform_weight * uniform_multiplier
+            candidate["mce_align_weight"] = align_weight * align_multiplier
+            candidates.append(candidate)
+        candidates[0]["mce_uniform_weight"] = uniform_weight
+        candidates[0]["mce_align_weight"] = align_weight
+    else:
+        parameter, default = {
+            "adv_debias": ("adv_debias_weight", 0.2),
+            "grl": ("grl_weight", 0.2),
+            "sm_pcfr": ("sm_lambda", 1.0),
+            "afrl": ("afrl_lambda", 1.0),
+            "pfrec": ("pfrec_adv_weight", 0.2),
+            "a_fsr": ("afsr_uniform_weight", 0.05),
+        }[method]
+        center = float(params.get(parameter, default))
+        for multiplier in (0.25, 0.5, 2.0, 4.0):
+            candidate = dict(params)
+            candidate[parameter] = center * multiplier
+            candidates.append(candidate)
+
+    for index, candidate in enumerate(candidates):
+        candidate["audit_candidate"] = f"c{index}"
+    return candidates
+
+
 def _ablation_params(method: str, base_params: Dict[str, Any]) -> Dict[str, Any]:
     if method == "fair_ncl":
         return _final_fair_ncl_params(base_params)
@@ -263,7 +532,10 @@ def _ablation_params(method: str, base_params: Dict[str, Any]) -> Dict[str, Any]
 
 
 def _comparison_params(method: str, base_params: Dict[str, Any]) -> Dict[str, Any]:
-    return _ablation_params(method, base_params)
+    params = _ablation_params(method, base_params)
+    if method in {"afrl", "pfrec"}:
+        params["frozen_backbone_init"] = "validation_reference"
+    return params
 
 
 def _final_fair_ncl_params(base_params: Dict[str, Any]) -> Dict[str, Any]:
@@ -368,8 +640,28 @@ def _resolve_base_params(base_params: Dict[str, Any], dataset: str, backbone: st
     return resolved
 
 
+def _resolve_method_params(base_params: Dict[str, Any],
+                           dataset: str,
+                           backbone: str,
+                           method: str) -> Dict[str, Any]:
+    resolved = _resolve_base_params(base_params, dataset, backbone)
+    method_scopes = base_params.get(SCOPED_METHODS_KEY, {})
+    if not isinstance(method_scopes, dict):
+        return resolved
+    method_scope = method_scopes.get(method)
+    if not isinstance(method_scope, dict):
+        return resolved
+    return merge_params(resolved, _resolve_base_params(method_scope, dataset, backbone))
+
+
 def _is_scoped_params(base_params: Dict[str, Any]) -> bool:
-    if any(key in base_params for key in (SCOPED_DEFAULT_KEY, SCOPED_BACKBONES_KEY, SCOPED_DATASETS_KEY, SCOPED_DATASET_BACKBONES_KEY)):
+    if any(key in base_params for key in (
+        SCOPED_DEFAULT_KEY,
+        SCOPED_BACKBONES_KEY,
+        SCOPED_DATASETS_KEY,
+        SCOPED_DATASET_BACKBONES_KEY,
+        SCOPED_METHODS_KEY,
+    )):
         return True
 
     for key in BACKBONES + DATASETS:
@@ -398,6 +690,10 @@ def _resolve_scope(phase: str,
         return _normalize_selection(datasets, ABLATION_DATASETS), _normalize_selection(backbones, ABLATION_BACKBONES)
     if phase == "comparison":
         return _normalize_selection(datasets, COMPARISON_DATASETS), _normalize_selection(backbones, COMPARISON_BACKBONES)
+    if phase in {"supplementary", "validation_reference", "validation_audit"}:
+        return _normalize_selection(datasets, REVISION_DATASETS), _normalize_selection(backbones, BACKBONES)
+    if phase == "mce_stability":
+        return _normalize_selection(datasets, REVISION_DATASETS), _normalize_selection(backbones, ("caser",))
     return tuple(datasets or ()), tuple(backbones or ())
 
 
@@ -531,7 +827,13 @@ def main():
             "semantic_alpha_tradeoff/semantic, semantic_hybrid, all/full, all_with_experimental."
         ),
     )
-    parser.add_argument("--seeds", nargs="+", type=int, default=[42])
+    parser.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Defaults to five final seeds for supplementary, three selection seeds for validation_reference/validation_audit, and 42 otherwise.",
+    )
     parser.add_argument(
         "--params-file",
         default=None,
@@ -542,10 +844,19 @@ def main():
         default=None,
         help="Inline JSON object with fixed parameters. Supports a flat object or scoped keys like __default__/__backbones__/__datasets__/__dataset_backbones__.",
     )
+    parser.add_argument(
+        "--params-overlay-file",
+        default=None,
+        help="Optional higher-priority JSON overlay, including validation-selected __methods__ scopes.",
+    )
     parser.add_argument("--output", default="experiments/jobs.jsonl")
     args = parser.parse_args()
 
-    base_params = merge_nested_params(_load_params_file(args.params_file), _load_params_json(args.params_json))
+    base_params = merge_nested_params(
+        _load_params_file(args.params_file),
+        _load_params_file(args.params_overlay_file),
+        _load_params_json(args.params_json),
+    )
     jobs = build_experiment_plan(
         args.phase,
         args.datasets,

@@ -12,10 +12,11 @@ from .augmentations import (
     SequenceAugmenter,
     build_low_skew_item_pool,
     build_cooccurrence_similarity,
-    compute_train_item_bias_scores,
+    compute_train_item_bias_statistics,
 )
 from .common import active_sensitive_attributes
 from .semantic_similarity import build_semantic_embedding_similarity, build_semantic_hybrid_similarity
+from .coserec import CoSeRecMethod, build_itemcf_iuf_similarity
 from .wrappers import (
     AFSRMethod,
     AFRLMethod,
@@ -31,12 +32,20 @@ from .wrappers import (
 METHOD_NAMES = (
     "baseline",
     "fair_ncl",
+    "fair_ncl_factorial",
+    "coserec",
     "ncl_only",
     "random_aug",
     "similarity_aug",
     "fair_ncl_alpha_tradeoff",
     "fair_ncl_semantic_alpha_tradeoff",
     "fair_ncl_semantic_hybrid_alpha_tradeoff",
+    "ncl_sr_mce",
+    "fair_aug_mce",
+    "skew_only_aug",
+    "fair_aug_no_geometry",
+    "fair_aug_no_augmented_ce",
+    "raw_skew_fair_ncl",
     "wo_fairness_sampling",
     "wo_semantic_sampling",
     "wo_alignment",
@@ -68,6 +77,10 @@ def create_method(method: str,
     backbone = create_model(backbone_name, config)
     resources = resources or build_method_resources(config, train_data or [], item_metadata=item_metadata)
 
+    if method == "coserec":
+        if backbone_name != "sasrec":
+            raise ValueError("CoSeRec is defined for the SASRec backbone only")
+        return CoSeRecMethod(backbone, config, resources["coserec_similarity"])
     if method == "baseline":
         return BackboneMethod(backbone, config, name=method)
     if method == "adv_debias":
@@ -90,10 +103,24 @@ def create_method(method: str,
     if method in {"similarity_aug", "wo_fairness_sampling"}:
         augmenter = _make_augmenter(config, "similarity", resources)
         return NCLMethod(backbone, config, augmenter, name=method)
-    if method == "wo_semantic_sampling":
+    if method == "ncl_sr_mce":
+        augmenter = _make_augmenter(config, "fair_ncl_alpha_tradeoff", resources)
+        return NCLMethod(backbone, config, augmenter, name=method)
+    if method in {"wo_semantic_sampling", "skew_only_aug"}:
         augmenter = _make_augmenter(config, "fair_ncl", resources)
         return NCLMethod(backbone, config, augmenter, name=method)
-    if method in {"fair_ncl", "wo_alignment", "wo_variance", "wo_covariance", "wo_augmented_ce"}:
+    if method in {
+        "fair_ncl",
+        "fair_ncl_factorial",
+        "wo_alignment",
+        "wo_variance",
+        "wo_covariance",
+        "wo_augmented_ce",
+        "fair_aug_mce",
+        "fair_aug_no_geometry",
+        "fair_aug_no_augmented_ce",
+        "raw_skew_fair_ncl",
+    }:
         augmenter = _make_augmenter(config, "fair_ncl_alpha_tradeoff", resources)
         return NCLMethod(backbone, config, augmenter, name=method)
     if method in {
@@ -115,27 +142,98 @@ def create_method(method: str,
     raise AssertionError("unreachable")
 
 
-def build_method_resources(config, train_data: list, item_metadata=None) -> Dict:
-    item_bias_scores = compute_train_item_bias_scores(
+def build_method_resources(config,
+                           train_data: list,
+                           item_metadata=None,
+                           train_event_sequences=None) -> Dict:
+    method = str(getattr(config, "method", "baseline")).lower()
+    bias_methods = {
+        "fair_ncl",
+        "fair_ncl_factorial",
+        "fair_ncl_alpha_tradeoff",
+        "fair_ncl_semantic_alpha_tradeoff",
+        "fair_ncl_semantic_hybrid_alpha_tradeoff",
+        "wo_semantic_sampling",
+        "wo_alignment",
+        "wo_variance",
+        "wo_covariance",
+        "wo_augmented_ce",
+        "random_low_skew",
+        "high_skew",
+        "skew_only_aug",
+        "fair_aug_mce",
+        "fair_aug_no_geometry",
+        "fair_aug_no_augmented_ce",
+        "raw_skew_fair_ncl",
+    }
+    similarity_methods = {
+        "fair_ncl",
+        "fair_ncl_factorial",
+        "fair_ncl_alpha_tradeoff",
+        "fair_ncl_semantic_alpha_tradeoff",
+        "fair_ncl_semantic_hybrid_alpha_tradeoff",
+        "similarity_aug",
+        "wo_fairness_sampling",
+        "wo_semantic_sampling",
+        "wo_alignment",
+        "wo_variance",
+        "wo_covariance",
+        "wo_augmented_ce",
+        "high_skew",
+        "a_fsr",
+        "ncl_sr_mce",
+        "skew_only_aug",
+        "fair_aug_mce",
+        "fair_aug_no_geometry",
+        "fair_aug_no_augmented_ce",
+        "raw_skew_fair_ncl",
+    }
+    if method == "coserec":
+        if not train_event_sequences:
+            raise ValueError("CoSeRec requires train_event_sequences")
+        similarity = build_itemcf_iuf_similarity(
+            train_event_sequences, config.cache_dir, config.dataset,
+            top_k=int(getattr(config, "coserec_similarity_top_k", 20)),
+        )
+        return {"coserec_similarity": similarity, "bias_statistics": {"scores": {}, "metric": None}}
+    needs_bias = method in bias_methods
+    needs_similarity = method in similarity_methods
+
+    bias_statistics = compute_train_item_bias_statistics(
         train_data,
         sensitive_attrs=active_sensitive_attributes(config),
+        train_event_sequences=train_event_sequences,
+        metric=getattr(config, "bias_metric", "prior_jsd"),
+        min_count=getattr(config, "bias_min_count", 5),
+        prior_strength=getattr(config, "bias_prior_strength", 5.0),
         smoothing=getattr(config, "bias_smoothing", 1.0),
-    ) if train_data else {}
-    wants_scored_similarity = (
+        prior_source=getattr(config, "bias_prior_source", "interaction"),
+        event_source=getattr(config, "bias_event_source", "unique_train_events"),
+    ) if train_data and needs_bias else {"scores": {}, "metric": None}
+    item_bias_scores = bias_statistics["scores"]
+    wants_scored_similarity = needs_similarity and (
         bool(getattr(config, "use_similarity_scores", False))
         or getattr(config, "method", "") in {
             "fair_ncl_alpha_tradeoff",
             "fair_ncl_semantic_alpha_tradeoff",
             "fair_ncl_semantic_hybrid_alpha_tradeoff",
             "fair_ncl",
+            "fair_ncl_factorial",
             "wo_alignment",
             "wo_variance",
             "wo_covariance",
             "wo_augmented_ce",
+            "ncl_sr_mce",
+            "fair_aug_mce",
+            "fair_aug_no_geometry",
+            "fair_aug_no_augmented_ce",
+            "raw_skew_fair_ncl",
         }
     )
     similarity_source = str(getattr(config, "similarity_source", "cooccurrence")).lower()
-    if wants_scored_similarity and similarity_source in {"semantic_hybrid", "hybrid_semantic"}:
+    if not needs_similarity:
+        similarity_candidates = {}
+    elif wants_scored_similarity and similarity_source in {"semantic_hybrid", "hybrid_semantic"}:
         if item_metadata is None:
             raise ValueError(
                 "Semantic hybrid similarity requires item metadata with item_text. "
@@ -195,6 +293,7 @@ def build_method_resources(config, train_data: list, item_metadata=None) -> Dict
         "similarity_candidates": similarity_candidates,
         "item_bias_scores": item_bias_scores,
         "low_skew_items": low_skew_items,
+        "bias_statistics": bias_statistics,
     }
 
 
@@ -210,5 +309,11 @@ def _make_augmenter(config, mode: str, resources: Dict) -> SequenceAugmenter:
         utility_alpha=getattr(config, "utility_alpha", 0.7),
         utility_beta=getattr(config, "utility_beta", 0.3),
         epsilon=getattr(config, "epsilon", 1.0),
+        unknown_bias_score=getattr(config, "bias_unknown_score", 1.0),
         seed=getattr(config, "seed", 42),
     )
+
+
+
+
+

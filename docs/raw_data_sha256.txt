@@ -1,0 +1,6 @@
+506d64ca44484487c11dc2d9a28de5c54948213e6b96285e298afe28d6ea4e0f  data/ml-1m/ratings.dat
+1dc3a95300cb19f7c10e027daf29b8cdf1d908dab65b5edfb45950aa389a10a3  data/ml-1m/users.dat
+0c7cb6a07b4ccdd56421b5c67bc230beb185861721b1e7be18dd46c2e63d7097  data/ml-1m/movies.dat
+3c93325012be6fb83105102c6c269805ac25a5366881ea78f9a2230c3998be7b  data/Taobao/raw_sample.csv
+affea398d503076af5982f0d7e5c5dd6dbf405b4a23be2c978eeaff5dd1759f4  data/Taobao/user_profile.csv
+da813217693df73dc711d25fd936d83ff6fc914be80cb37e6eef086512bb5c6a  data/Taobao/ad_feature.csv

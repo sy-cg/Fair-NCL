@@ -216,19 +216,23 @@ def _extract_item_texts(item_metadata, num_items: int) -> Tuple[List[int], List[
     item_ids: List[int] = []
     texts: List[str] = []
     if hasattr(item_metadata, "iterrows"):
-        for _, row in item_metadata.iterrows():
-            item_id = _row_get(row, "movie_id", _row_get(row, "item_id", None))
-            text = _row_get(row, "item_text", None)
-            if text is None or not str(text).strip() or str(text).lower() == "nan":
-                text = _build_fallback_text(row)
-            try:
-                item_id = int(item_id)
-            except (TypeError, ValueError):
-                continue
-            text = str(text).strip()
-            if 0 < item_id <= num_items and text:
-                item_ids.append(item_id)
-                texts.append(text)
+        rows = (row for _, row in item_metadata.iterrows())
+    else:
+        rows = item_metadata
+
+    for row in rows:
+        item_id = _row_get(row, "movie_id", _row_get(row, "item_id", None))
+        text = _row_get(row, "item_text", None)
+        if text is None or not str(text).strip() or str(text).lower() == "nan":
+            text = _build_fallback_text(row)
+        try:
+            item_id = int(item_id)
+        except (TypeError, ValueError):
+            continue
+        text = str(text).strip()
+        if 0 < item_id <= num_items and text:
+            item_ids.append(item_id)
+            texts.append(text)
     return item_ids, texts
 
 

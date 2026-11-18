@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from collections import defaultdict
 from typing import Dict, Iterable, Optional
 
@@ -10,7 +11,9 @@ from tqdm import tqdm
 
 from analysis.mechanism import export_mechanism_analysis
 from evaluation.full_ranking import evaluate_full_ranking_loader
+from experiments.backbone_initialization import enforce_frozen_backbone_eval
 from .common import move_batch_to_device, reporting_sensitive_attributes
+from .training_safety import safe_backward_step
 
 
 def train_research_method(model,
@@ -43,10 +46,17 @@ def train_research_method(model,
     postfix_interval = max(1, int(getattr(config, "progress_postfix_interval", 1)))
     eval_interval = max(1, int(getattr(config, "eval_interval", 1)))
 
+    training_started = time.perf_counter()
+    if getattr(config.device, "type", "cpu") == "cuda":
+        torch.cuda.reset_peak_memory_stats(config.device)
+
     for epoch in range(config.num_epochs):
+        epoch_started = time.perf_counter()
         model.train()
+        enforce_frozen_backbone_eval(model)
         train_losses = defaultdict(float)
         num_batches = 0
+        skipped_nonfinite_updates = 0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.num_epochs} [train]")
         for batch_index, batch in enumerate(pbar, start=1):
@@ -61,11 +71,22 @@ def train_research_method(model,
                     loss_dict = model.compute_loss(batch)
                     loss = loss_dict["loss"]
 
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), getattr(config, "gradient_clip_val", 5.0))
-                scaler.step(optimizer)
-                scaler.update()
+                step_state = safe_backward_step(
+                    model.parameters(),
+                    optimizer,
+                    scaler,
+                    loss,
+                    getattr(config, "gradient_clip_val", 5.0),
+                )
+                if not step_state["stepped"]:
+                    skipped_nonfinite_updates += 1
+                    if skipped_nonfinite_updates <= 3 or skipped_nonfinite_updates % 50 == 0:
+                        print(
+                            "[WARN] Skipping optimizer update with "
+                            f"{step_state['reason']} at epoch {epoch + 1}, "
+                            f"batch {batch_index}."
+                        )
+                    continue
 
             for key, value in loss_dict.items():
                 if isinstance(value, torch.Tensor):
@@ -76,12 +97,14 @@ def train_research_method(model,
 
         for key, value in train_losses.items():
             history[f"train_{key}"].append(value / max(1, num_batches))
+        history["skipped_nonfinite_updates"].append(skipped_nonfinite_updates)
+        history["epoch_train_seconds"].append(time.perf_counter() - epoch_started)
 
         should_evaluate = ((epoch + 1) % eval_interval == 0) or (epoch + 1 == config.num_epochs)
         if not should_evaluate:
             continue
 
-        val_results = evaluate_research_method(model, val_loader, config)
+        val_results = evaluate_research_method(model, val_loader, config, export_per_user=False)
         for key, value in val_results["selected"].items():
             if isinstance(value, (int, float, np.floating)):
                 history[f"val_{key}"].append(float(value))
@@ -113,8 +136,53 @@ def train_research_method(model,
             best_val_results or {},
             job_info,
         )
+        _save_json(
+            os.path.join(output_dir, "validation_results.json"),
+            best_val_results or {},
+        )
 
-    test_results = evaluate_research_method(model, test_loader, config)
+    training_seconds = time.perf_counter() - training_started
+    if not bool(getattr(config, "evaluate_test", True)):
+        validation_only_result = {
+            "status": "not_run_by_protocol",
+            "validation_only": True,
+            "runtime": {
+                "training_seconds": float(training_seconds),
+                "test_evaluation_seconds": 0.0,
+                "parameter_count": int(sum(parameter.numel() for parameter in model.parameters())),
+                "peak_cuda_memory_bytes": int(torch.cuda.max_memory_allocated(config.device))
+                if getattr(config.device, "type", "cpu") == "cuda" else 0,
+            },
+        }
+        augmenter = getattr(model, "augmenter", None)
+        if augmenter is not None and hasattr(augmenter, "diagnostic_summary"):
+            validation_only_result["augmentation_diagnostics"] = _jsonable(augmenter.diagnostic_summary())
+        _save_json(os.path.join(output_dir, "history.json"), dict(history))
+        _save_json(os.path.join(output_dir, "test_results.json"), validation_only_result)
+        return {
+            "history": dict(history),
+            "validation": best_val_results or {},
+            "test": validation_only_result,
+        }
+
+    evaluation_started = time.perf_counter()
+    test_results = evaluate_research_method(
+        model,
+        test_loader,
+        config,
+        export_per_user=bool(getattr(config, "export_per_user_metrics", False)),
+    )
+    evaluation_seconds = time.perf_counter() - evaluation_started
+    test_results["runtime"] = {
+        "training_seconds": float(training_seconds),
+        "test_evaluation_seconds": float(evaluation_seconds),
+        "parameter_count": int(sum(parameter.numel() for parameter in model.parameters())),
+        "peak_cuda_memory_bytes": int(torch.cuda.max_memory_allocated(config.device))
+        if getattr(config.device, "type", "cpu") == "cuda" else 0,
+    }
+    augmenter = getattr(model, "augmenter", None)
+    if augmenter is not None and hasattr(augmenter, "diagnostic_summary"):
+        test_results["augmentation_diagnostics"] = _jsonable(augmenter.diagnostic_summary())
     if getattr(config, "export_mechanism_analysis", True):
         try:
             test_results["mechanism"] = _jsonable(
@@ -131,7 +199,7 @@ def train_research_method(model,
 
 
 @torch.inference_mode()
-def evaluate_research_method(model, data_loader, config) -> Dict:
+def evaluate_research_method(model, data_loader, config, export_per_user: bool = False) -> Dict:
     model.eval()
     results = evaluate_full_ranking_loader(
         data_loader=data_loader,
@@ -140,12 +208,17 @@ def evaluate_research_method(model, data_loader, config) -> Dict:
         sensitive_attributes=reporting_sensitive_attributes(config),
         desc="evaluate",
         legacy_output=False,
+        export_per_user=export_per_user,
+        include_intersectional=bool(getattr(config, "report_intersectional_groups", False)),
     )
-    return {
+    output = {
         "utility": _jsonable(results["utility"]),
         "fairness": _jsonable(results["fairness"]),
         "selected": _jsonable(results["selected"]),
     }
+    if export_per_user:
+        output["per_user"] = _jsonable(results.get("per_user", []))
+    return output
 
 
 def _save_checkpoint(model, config, output_dir, filename, epoch, metrics, job_info):

@@ -5,6 +5,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 
+from fairness.augmentation_diagnostics import AugmentationDiagnostics
+from fairness.skew import compute_train_item_bias_scores, compute_train_item_bias_statistics
+
 
 class SequenceAugmenter:
     """Sequence augmentation policies used by Fair-NCL and ablations."""
@@ -20,6 +23,7 @@ class SequenceAugmenter:
                  utility_alpha: float = 0.7,
                  utility_beta: float = 0.3,
                  epsilon: float = 1.0,
+                 unknown_bias_score: float = 1.0,
                  seed: int = 42):
         self.num_items = int(num_items)
         self.max_seq_len = int(max_seq_len)
@@ -31,7 +35,9 @@ class SequenceAugmenter:
         self.utility_alpha = float(utility_alpha)
         self.utility_beta = float(utility_beta)
         self.epsilon = float(epsilon)
+        self.unknown_bias_score = float(unknown_bias_score)
         self.rng = random.Random(seed)
+        self.diagnostics = AugmentationDiagnostics()
 
     def augment(self, input_seq: torch.Tensor) -> torch.Tensor:
         if self.mode in {"none", "identity"} or self.augment_ratio <= 0:
@@ -55,7 +61,10 @@ class SequenceAugmenter:
         for row in range(out.size(0)):
             positions = self._sample_positions(out[row])
             for pos in positions:
-                out[row, pos] = self.rng.randint(1, self.num_items)
+                original = int(out[row, pos].item())
+                candidate = self.rng.randint(1, self.num_items)
+                out[row, pos] = candidate
+                self.diagnostics.record(replaced=candidate != original)
         return out
 
     def _random_low_skew_replace(self, input_seq: torch.Tensor) -> torch.Tensor:
@@ -67,9 +76,15 @@ class SequenceAugmenter:
                 item = int(out[row, pos].item())
                 candidates = [cand for cand in fallback_pool if cand != item]
                 if candidates:
-                    out[row, pos] = self.rng.choice(candidates)
+                    candidate = self.rng.choice(candidates)
                 else:
-                    out[row, pos] = self.rng.randint(1, self.num_items)
+                    candidate = self.rng.randint(1, self.num_items)
+                out[row, pos] = candidate
+                self.diagnostics.record(
+                    replaced=candidate != item,
+                    base_bias=self.item_bias_scores.get(item, self.unknown_bias_score),
+                    candidate_bias=self.item_bias_scores.get(candidate, self.unknown_bias_score),
+                )
         return out
 
     def _similarity_replace(self, input_seq: torch.Tensor, sampling_mode: str) -> torch.Tensor:
@@ -83,9 +98,21 @@ class SequenceAugmenter:
                     candidates = self.similarity_candidates.get(0, [])
                 candidates = self._normalize_candidates(item, candidates)
                 if not candidates:
+                    self.diagnostics.record(replaced=False)
                     continue
-                out[row, pos] = self._sample_candidate(item, candidates, sampling_mode)
+                candidate = self._sample_candidate(item, candidates, sampling_mode)
+                out[row, pos] = candidate
+                similarity = next((score for candidate_id, score in candidates if candidate_id == candidate), None)
+                self.diagnostics.record(
+                    replaced=candidate != item,
+                    similarity=similarity,
+                    base_bias=self.item_bias_scores.get(item, self.unknown_bias_score),
+                    candidate_bias=self.item_bias_scores.get(candidate, self.unknown_bias_score),
+                )
         return out
+
+    def diagnostic_summary(self) -> Dict[str, object]:
+        return self.diagnostics.summary()
 
     def _normalize_candidates(self, item: int, candidates: Sequence[Any]) -> List[Tuple[int, float]]:
         normalized: List[Tuple[int, float]] = []
@@ -122,10 +149,10 @@ class SequenceAugmenter:
         if sampling_mode == "uniform":
             return self.rng.choice(candidates)[0]
 
-        base_bias = self.item_bias_scores.get(item, 0.0)
+        base_bias = self.item_bias_scores.get(item, self.unknown_bias_score)
         utilities = []
         for cand, similarity_score in candidates:
-            cand_bias = self.item_bias_scores.get(cand, 0.0)
+            cand_bias = self.item_bias_scores.get(cand, self.unknown_bias_score)
             if sampling_mode == "low_skew":
                 similarity_term = 1.0
                 bias_delta = max(0.0, base_bias - cand_bias)
@@ -233,38 +260,6 @@ def _sparse_cosine(left: Dict[int, float], right: Dict[int, float]) -> float:
     if left_norm <= 0.0 or right_norm <= 0.0:
         return 0.0
     return float(dot / (left_norm * right_norm))
-
-
-def compute_train_item_bias_scores(train_data: Iterable[Dict],
-                                   sensitive_attrs: Sequence[str] = ("gender", "age_group"),
-                                   smoothing: float = 1.0) -> Dict[int, float]:
-    """Estimate train-only item demographic skew for fairness-aware augmentation."""
-    item_group_counts = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
-    item_total = defaultdict(float)
-
-    for sample in train_data:
-        items = [int(x) for x in sample.get("input_seq", []) if int(x) > 0]
-        target = int(sample.get("target", 0))
-        if target > 0:
-            items.append(target)
-        for item in items:
-            item_total[item] += 1.0
-            for attr in sensitive_attrs:
-                if attr in sample:
-                    item_group_counts[item][attr][int(sample[attr])] += 1.0
-
-    bias_scores = {}
-    for item, attr_counts in item_group_counts.items():
-        item_bias = 0.0
-        for groups in attr_counts.values():
-            values = list(groups.values())
-            if len(values) < 2:
-                values = values + [0.0]
-            total = sum(values) + smoothing * len(values)
-            probs = [(v + smoothing) / total for v in values]
-            item_bias += max(probs) - min(probs)
-        bias_scores[int(item)] = item_bias / max(1, len(attr_counts))
-    return bias_scores
 
 
 def build_low_skew_item_pool(item_bias_scores: Dict[int, float],

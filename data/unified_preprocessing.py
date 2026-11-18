@@ -470,7 +470,7 @@ class UnifiedSequentialPreprocessor:
 
         output_path = os.path.join(dataset_dir, "processed_data.pkl")
         with open(output_path, "wb") as f:
-            pickle.dump(data, f)
+            pickle.dump(self._make_pickle_payload(data), f, protocol=pickle.HIGHEST_PROTOCOL)
 
         summary = self._build_summary(data)
 
@@ -539,6 +539,52 @@ class UnifiedSequentialPreprocessor:
             else:
                 result[str(int(key))] = int(value)
         return result
+
+    @staticmethod
+    def _make_pickle_payload(data: Dict) -> Dict:
+        payload = dict(data)
+        for key in ("users", "movies", "items"):
+            value = payload.get(key)
+            if isinstance(value, pd.DataFrame):
+                payload[key] = UnifiedSequentialPreprocessor._dataframe_records(value)
+
+        for key in ("user_map", "item_map"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                payload[key] = {
+                    UnifiedSequentialPreprocessor._plain_scalar(old_id): int(new_id)
+                    for old_id, new_id in value.items()
+                }
+
+        sequences = payload.get("sequences")
+        if isinstance(sequences, dict):
+            payload["sequences"] = {
+                int(user_id): [int(item_id) for item_id in sequence]
+                for user_id, sequence in sequences.items()
+            }
+
+        return payload
+
+    @staticmethod
+    def _dataframe_records(frame: pd.DataFrame):
+        return [
+            {
+                str(key): UnifiedSequentialPreprocessor._plain_scalar(value)
+                for key, value in row.items()
+            }
+            for row in frame.to_dict(orient="records")
+        ]
+
+    @staticmethod
+    def _plain_scalar(value):
+        try:
+            if bool(pd.isna(value)):
+                return None
+        except (TypeError, ValueError):
+            pass
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
 
     @staticmethod
     def _cross_counts_as_dict(df: pd.DataFrame, columns) -> Dict[str, int]:

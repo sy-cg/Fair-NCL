@@ -275,12 +275,16 @@ def create_research_data_loaders(train_data, val_data, test_data, config):
     """Create loaders for the refactored research pipeline."""
     num_items = int(getattr(config, "num_items", 0) or _max_item_from_splits(train_data, val_data, test_data))
     user_history_dict = _build_user_history_dict(train_data, val_data, test_data)
+    train_history_dict = (
+        _build_user_history_dict(train_data)
+        if getattr(config, "train_negative_history_only", False) else user_history_dict
+    )
 
     train_dataset = OptimizedMovieLensDataset(
         train_data,
         config.max_seq_len,
         num_items,
-        user_history_dict,
+        train_history_dict,
         seed=getattr(config, "seed", 42),
         num_negative=getattr(config, "train_num_negative", 1),
         cache_dir=config.cache_dir,
@@ -308,3 +312,5 @@ def create_research_data_loaders(train_data, val_data, test_data, config):
     val_loader = GPUOptimizedDataLoader(val_dataset, config.eval_batch_size, shuffle=False, config=config)
     test_loader = GPUOptimizedDataLoader(test_dataset, config.eval_batch_size, shuffle=False, config=config)
     return train_loader, val_loader, test_loader
+
+

@@ -61,10 +61,23 @@ def evaluate_full_ranking_loader(data_loader,
                                  predict_fn: Callable[[Dict], torch.Tensor],
                                  sensitive_attributes: Optional[Iterable[str]] = None,
                                  desc: str = "evaluate",
-                                 legacy_output: bool = False) -> Dict[str, object]:
+                                 legacy_output: bool = False,
+                                 export_per_user: Optional[bool] = None,
+                                 include_intersectional: Optional[bool] = None) -> Dict[str, object]:
     """Evaluate a model with full-ranking over the complete item space."""
     topk_list = _normalize_topk(getattr(config, "topk_list", [5, 10, 20]))
     sensitive_attributes = list(sensitive_attributes or getattr(config, "sensitive_attributes", []))
+    export_per_user = (
+        bool(getattr(config, "export_per_user_metrics", False))
+        if export_per_user is None else bool(export_per_user)
+    )
+    include_intersectional = (
+        bool(getattr(config, "report_intersectional_groups", False))
+        if include_intersectional is None else bool(include_intersectional)
+    )
+    evaluation_attributes = list(sensitive_attributes)
+    if include_intersectional and {"gender", "age_group"}.issubset(sensitive_attributes):
+        evaluation_attributes.append("gender_age")
 
     utility_sums = defaultdict(float)
     group_sums = {
@@ -73,8 +86,9 @@ def evaluate_full_ranking_loader(data_loader,
             "NDCG": {k: defaultdict(float) for k in topk_list},
             "count": defaultdict(int),
         }
-        for attr in sensitive_attributes
+        for attr in evaluation_attributes
     }
+    per_user_records = []
     user_count = 0
 
     for raw_batch in tqdm(data_loader, desc=desc, leave=False):
@@ -100,10 +114,15 @@ def evaluate_full_ranking_loader(data_loader,
             utility_sums[f"NDCG@{k}"] += float(batch_metrics[k]["NDCG"].sum().item())
             utility_sums[f"MRR@{k}"] += float(batch_metrics[k]["MRR"].sum().item())
 
-        for attr in sensitive_attributes:
-            if attr not in batch:
-                continue
-            attr_values = batch[attr].detach().cpu().long()
+        batch_attributes = {
+            attr: batch[attr].detach().cpu().long()
+            for attr in sensitive_attributes
+            if attr in batch
+        }
+        if include_intersectional and "gender" in batch_attributes and "age_group" in batch_attributes:
+            batch_attributes["gender_age"] = batch_attributes["gender"] * 1000 + batch_attributes["age_group"]
+
+        for attr, attr_values in batch_attributes.items():
             for group in attr_values.unique().tolist():
                 group_mask = attr_values == int(group)
                 group_sums[attr]["count"][int(group)] += int(group_mask.sum().item())
@@ -114,6 +133,28 @@ def evaluate_full_ranking_loader(data_loader,
                     group_sums[attr]["NDCG"][k][int(group)] += float(
                         batch_metrics[k]["NDCG"][group_mask.to(batch_metrics[k]["NDCG"].device)].sum().item()
                     )
+
+        if export_per_user:
+            ranks_cpu = ranks.detach().cpu().long()
+            user_ids = batch.get("user_id")
+            if isinstance(user_ids, torch.Tensor):
+                user_ids = user_ids.detach().cpu().long()
+            else:
+                user_ids = torch.arange(user_count - batch_size, user_count, dtype=torch.long)
+            for row_index in range(batch_size):
+                record = {
+                    "user_id": int(user_ids[row_index].item()),
+                    "rank": int(ranks_cpu[row_index].item()),
+                }
+                for attr in sensitive_attributes:
+                    if attr in batch_attributes:
+                        record[attr] = int(batch_attributes[attr][row_index].item())
+                if "gender" in record and "age_group" in record:
+                    record["gender_age"] = f"g{record['gender']}_a{record['age_group']}"
+                for k in topk_list:
+                    record[f"HitRate@{k}"] = float(batch_metrics[k]["HitRate"][row_index].detach().cpu().item())
+                    record[f"NDCG@{k}"] = float(batch_metrics[k]["NDCG"][row_index].detach().cpu().item())
+                per_user_records.append(record)
 
     utility = _finalize_utility(utility_sums, user_count, topk_list)
     fairness = _finalize_group_fairness(group_sums, topk_list)
@@ -126,11 +167,14 @@ def evaluate_full_ranking_loader(data_loader,
             "selected": selected,
         }
 
-    return {
+    result = {
         "utility": utility,
         "fairness": fairness,
         "selected": selected,
     }
+    if export_per_user:
+        result["per_user"] = per_user_records
+    return result
 
 
 def _normalize_topk(topk_list: Iterable[int]) -> List[int]:
@@ -187,14 +231,17 @@ def _finalize_group_fairness(group_sums: Dict[str, Dict], topk_list: Iterable[in
             ndcg_values = list(group_ndcg.values())
 
             attr_result[f"group_hitrate@{k}"] = group_hit
+            attr_result[f"group_count@{k}"] = {int(group): int(count) for group, count in counts.items()}
             attr_result[f"hitrate@{k}_gap"] = float(max(hit_values) - min(hit_values)) if len(hit_values) >= 2 else 0.0
             attr_result[f"hitrate@{k}_worst_group"] = float(min(hit_values)) if hit_values else 0.0
             attr_result[f"hitrate@{k}_std"] = float(np.std(hit_values)) if hit_values else 0.0
+            attr_result.update(_directional_group_metrics(group_hit, f"hitrate@{k}"))
 
             attr_result[f"group_ndcg@{k}"] = group_ndcg
             attr_result[f"ndcg@{k}_gap"] = float(max(ndcg_values) - min(ndcg_values)) if len(ndcg_values) >= 2 else 0.0
             attr_result[f"ndcg@{k}_worst_group"] = float(min(ndcg_values)) if ndcg_values else 0.0
             attr_result[f"ndcg@{k}_std"] = float(np.std(ndcg_values)) if ndcg_values else 0.0
+            attr_result.update(_directional_group_metrics(group_ndcg, f"ndcg@{k}"))
 
         fairness[attr] = attr_result
     return fairness
@@ -208,7 +255,34 @@ def _selected_metrics(utility: Dict[str, float], fairness: Dict[str, Dict[str, o
     for attr, attr_metrics in fairness.items():
         selected[f"{attr}_HitRate@10_Gap"] = float(attr_metrics.get("hitrate@10_gap", 0.0))
         selected[f"{attr}_NDCG@10_Gap"] = float(attr_metrics.get("ndcg@10_gap", 0.0))
+        selected[f"{attr}_NDCG@10_SignedGap"] = float(attr_metrics.get("ndcg@10_signed_gap", 0.0))
+        selected[f"{attr}_NDCG@10_RelativeGap"] = float(attr_metrics.get("ndcg@10_relative_gap", 0.0))
+        selected[f"{attr}_NDCG@10_WorstGroup"] = float(attr_metrics.get("ndcg@10_worst_group", 0.0))
     return selected
+
+
+def _directional_group_metrics(group_values: Dict[int, float], prefix: str) -> Dict[str, object]:
+    if not group_values:
+        return {
+            f"{prefix}_signed_gap": 0.0,
+            f"{prefix}_relative_gap": 0.0,
+            f"{prefix}_worst_group_id": None,
+            f"{prefix}_best_group_id": None,
+        }
+    ordered_groups = sorted(group_values)
+    worst_group = min(group_values, key=group_values.get)
+    best_group = max(group_values, key=group_values.get)
+    best_value = float(group_values[best_group])
+    worst_value = float(group_values[worst_group])
+    signed_gap = 0.0
+    if len(ordered_groups) >= 2:
+        signed_gap = float(group_values[ordered_groups[0]] - group_values[ordered_groups[-1]])
+    return {
+        f"{prefix}_signed_gap": signed_gap,
+        f"{prefix}_relative_gap": float((best_value - worst_value) / best_value) if best_value > 0 else 0.0,
+        f"{prefix}_worst_group_id": int(worst_group),
+        f"{prefix}_best_group_id": int(best_group),
+    }
 
 
 def _legacy_performance_metrics(utility: Dict[str, float], topk_list: Iterable[int]) -> Dict[str, float]:

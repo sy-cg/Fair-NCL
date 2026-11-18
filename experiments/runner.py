@@ -4,13 +4,17 @@ import json
 import os
 import pickle
 import shutil
+import time
 from typing import Dict
 
 import torch
 
 from config import Config
 from data.dataset import create_research_data_loaders
-from .job_utils import stable_job_id
+from fairness.skew import build_train_event_sequences
+from .backbone_initialization import initialize_frozen_backbone
+from .job_utils import result_artifact_is_complete, stable_job_id
+from .provenance import collect_run_provenance, write_run_provenance
 from methods.registry import build_method_resources, create_method
 from methods.trainer import train_research_method
 from utils.utils import set_seed
@@ -34,7 +38,7 @@ def run_experiment_job(job: Dict,
                        skip_existing: bool = False):
     output_dir = os.path.join(results_root, job["dataset"], job["job_id"])
     result_path = os.path.join(output_dir, "test_results.json")
-    if skip_existing and os.path.exists(result_path):
+    if skip_existing and result_artifact_is_complete(job, results_root):
         history_path = os.path.join(output_dir, "history.json")
         history = _load_json(history_path) if os.path.exists(history_path) else {}
         test_results = _load_json(result_path)
@@ -82,6 +86,18 @@ def run_experiment_job(job: Dict,
     config.model_save_dir = os.path.join(results_root, config.dataset, job["job_id"], "checkpoints")
     os.makedirs(config.cache_dir, exist_ok=True)
     os.makedirs(config.model_save_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+
+    with open(os.path.join(output_dir, "effective_config.json"), "w", encoding="utf-8") as f:
+        json.dump(vars(config), f, indent=2, ensure_ascii=False, default=str)
+
+    write_run_provenance(
+        collect_run_provenance(config, data, workspace=os.getcwd()),
+        os.path.join(output_dir, "run_provenance.json"),
+    )
+
+    with open(os.path.join(output_dir, "job.json"), "w", encoding="utf-8") as f:
+        json.dump(job, f, indent=2, ensure_ascii=False)
 
     train_data = data["train_data"]
     val_data = data["val_data"]
@@ -93,7 +109,21 @@ def run_experiment_job(job: Dict,
         config,
     )
     item_metadata = data.get("items", data.get("movies"))
-    resources = build_method_resources(config, train_data, item_metadata=item_metadata)
+    train_event_sequences = build_train_event_sequences(
+        data.get("sequences", {}),
+        train_data,
+    )
+    if str(getattr(config, "bias_event_source", "unique_train_events")).lower() == "prefix_samples":
+        train_event_sequences = None
+    resource_started = time.perf_counter()
+    resources = build_method_resources(
+        config,
+        train_data,
+        item_metadata=item_metadata,
+        train_event_sequences=train_event_sequences or None,
+    )
+    resource_seconds = time.perf_counter() - resource_started
+    _save_resource_diagnostics(output_dir, resources, resource_seconds, config.cache_dir)
     model = create_method(
         method=job["method"],
         backbone_name=job["backbone"],
@@ -101,16 +131,22 @@ def run_experiment_job(job: Dict,
         train_data=None,
         resources=resources,
     )
+    backbone_initialization = initialize_frozen_backbone(
+        model,
+        job,
+        results_root,
+        checkpoint_loader=lambda path: torch.load(str(path), map_location="cpu"),
+    )
+    if backbone_initialization is not None:
+        config.backbone_initialization = backbone_initialization
+        with open(os.path.join(output_dir, "backbone_initialization.json"), "w", encoding="utf-8") as f:
+            json.dump(backbone_initialization, f, indent=2, ensure_ascii=False)
     del resources
     del train_data
     del val_data
     del test_data
     del data
     gc.collect()
-
-    os.makedirs(output_dir, exist_ok=True)
-    with open(os.path.join(output_dir, "job.json"), "w", encoding="utf-8") as f:
-        json.dump(job, f, indent=2, ensure_ascii=False)
 
     return train_research_method(
         model=model,
@@ -174,6 +210,48 @@ def load_job_from_jsonl(path: str, index: int) -> Dict:
 def _load_json(path: str) -> Dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _save_resource_diagnostics(output_dir: str,
+                               resources: Dict,
+                               elapsed_seconds: float,
+                               cache_dir: str) -> None:
+    statistics = resources.get("bias_statistics", {})
+    scores = [float(value) for value in statistics.get("scores", {}).values()]
+    supports = [int(value) for value in statistics.get("item_support", {}).values()]
+    diagnostics = {
+        key: value
+        for key, value in statistics.items()
+        if key not in {"scores", "per_attribute_scores", "item_support"}
+    }
+    diagnostics.update({
+        "resource_build_seconds": float(elapsed_seconds),
+        "similarity_items": len(resources.get("similarity_candidates", {})),
+        "low_skew_pool_items": len(resources.get("low_skew_items", [])),
+        "cache_bytes": _directory_size(cache_dir),
+        "score_min": min(scores) if scores else None,
+        "score_max": max(scores) if scores else None,
+        "score_mean": sum(scores) / len(scores) if scores else None,
+        "support_min": min(supports) if supports else None,
+        "support_max": max(supports) if supports else None,
+        "support_mean": sum(supports) / len(supports) if supports else None,
+    })
+    with open(os.path.join(output_dir, "resource_diagnostics.json"), "w", encoding="utf-8") as handle:
+        json.dump(diagnostics, handle, indent=2, ensure_ascii=False)
+
+
+def _directory_size(path: str) -> int:
+    total = 0
+    if not os.path.exists(path):
+        return total
+    for root, _, files in os.walk(path):
+        for filename in files:
+            file_path = os.path.join(root, filename)
+            try:
+                total += os.path.getsize(file_path)
+            except OSError:
+                continue
+    return int(total)
 
 
 def _resolve_source_job_id(job: Dict, results_root: str) -> str:

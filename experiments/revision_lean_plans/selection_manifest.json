@@ -1,0 +1,35 @@
+{
+  "coserec_final_pairs": [
+    [
+      "ml-1m",
+      "sasrec"
+    ],
+    [
+      "taobao",
+      "sasrec"
+    ]
+  ],
+  "excluded_coserec_pairs": [],
+  "validation_selection": {
+    "coserec": [
+      {
+        "dataset": "ml-1m",
+        "backbone": "sasrec",
+        "status": "selected",
+        "selected_candidate": "cf_0.03",
+        "selected_params": {
+          "coserec_cf_weight": 0.03
+        }
+      },
+      {
+        "dataset": "taobao",
+        "backbone": "sasrec",
+        "status": "selected",
+        "selected_candidate": "cf_0.3",
+        "selected_params": {
+          "coserec_cf_weight": 0.3
+        }
+      }
+    ]
+  }
+}
