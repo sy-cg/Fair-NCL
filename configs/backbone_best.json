@@ -1,0 +1,70 @@
+{
+  "__dataset_backbones__": {
+    "ml-1m": {
+      "sasrec": {
+        "learning_rate": 0.0005,
+        "hidden_units": 64,
+        "dropout_rate": 0.2
+      },
+      "bert4rec": {
+        "learning_rate": 0.001,
+        "hidden_units": 128,
+        "dropout_rate": 0.1
+      },
+      "gru4rec": {
+        "learning_rate": 0.0005,
+        "hidden_units": 128,
+        "dropout_rate": 0.1
+      },
+      "caser": {
+        "learning_rate": 0.001,
+        "hidden_units": 128,
+        "dropout_rate": 0.2
+      }
+    },
+	"lastfm-1k": {
+      "sasrec": {
+        "learning_rate": 0.001,
+        "hidden_units": 128,
+        "dropout_rate": 0.1
+      },
+      "bert4rec": {
+        "learning_rate": 0.0005,
+        "hidden_units": 128,
+        "dropout_rate": 0.1
+      },
+      "gru4rec": {
+        "learning_rate": 0.0005,
+        "hidden_units": 128,
+        "dropout_rate": 0.2
+      },
+	  "caser": {
+        "learning_rate": 0.001,
+        "hidden_units": 64,
+        "dropout_rate": 0.2
+      }
+    },
+	"taobao": {
+      "sasrec": {
+        "learning_rate": 0.0005,
+        "hidden_units": 64,
+        "dropout_rate": 0.1
+      },
+      "bert4rec": {
+        "learning_rate": 0.0005,
+        "hidden_units": 64,
+        "dropout_rate": 0.2
+      },
+      "gru4rec": {
+        "learning_rate": 0.001,
+        "hidden_units": 128,
+        "dropout_rate": 0.1
+      },
+      "caser": {
+        "learning_rate": 0.0005,
+        "hidden_units": 128,
+        "dropout_rate": 0.1
+      }
+    }
+  }
+}
