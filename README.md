@@ -57,7 +57,7 @@ The processed artifacts include the split metadata and dataset summary. The
 pipeline uses chronological leave-two-out validation/test targets and computes
 all item-skew resources from training events only.
 
-## KBS revision experiments
+## experiments
 
 The complete fixed workflow, task counts, parameter-selection rule, execution
 order, and report-generation commands are in
