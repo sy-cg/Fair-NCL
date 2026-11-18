@@ -11,8 +11,14 @@ TABLES_DIR="${TABLES_DIR:-tables}"
 RUN_MECHANISM_SUMMARY="${RUN_MECHANISM_SUMMARY:-0}"
 DEBUG_MISSING_FIRST="${DEBUG_MISSING_FIRST:-0}"
 PHASE_OVERRIDE="${PHASE_OVERRIDE:-}"
+FAIR_NCL_TMPDIR="${FAIR_NCL_TMPDIR:-$ROOT_DIR/cache/tmp}"
+export FAIR_NCL_TMPDIR
+export TMPDIR="$FAIR_NCL_TMPDIR"
+export TEMP="$FAIR_NCL_TMPDIR"
+export TMP="$FAIR_NCL_TMPDIR"
 
 mkdir -p "$TABLES_DIR"
+mkdir -p "$FAIR_NCL_TMPDIR"
 
 if [[ -z "$PLAN" ]]; then
   echo "[ERROR] Missing jobs plan."
@@ -31,22 +37,9 @@ fi
 PLAN_BASENAME="$(basename "$PLAN" .jsonl)"
 
 echo "[INFO] Inspecting plan: $PLAN"
-SUMMARY_JSON="$(PLAN="$PLAN" RESULTS_ROOT="$RESULTS_ROOT" python -c 'import json, os; plan=os.environ["PLAN"]; results_root=os.environ["RESULTS_ROOT"]; jobs=[]; 
-with open(plan, "r", encoding="utf-8") as f:
-    for idx, line in enumerate(f):
-        job=json.loads(line); job["_index"]=idx; path=os.path.join(results_root, job["dataset"], job["job_id"], "test_results.json"); job["_done"]=os.path.exists(path); jobs.append(job)
-phase=jobs[0]["phase"] if jobs else None
-print(json.dumps({"total": len(jobs), "done": sum(1 for j in jobs if j["_done"]), "todo_indices": [j["_index"] for j in jobs if not j["_done"]], "phase": phase}))'
-)"
-
-TOTAL="$(SUMMARY_JSON="$SUMMARY_JSON" python -c 'import json, os; print(json.loads(os.environ["SUMMARY_JSON"])["total"])'
-)"
-
-DONE="$(SUMMARY_JSON="$SUMMARY_JSON" python -c 'import json, os; print(json.loads(os.environ["SUMMARY_JSON"])["done"])'
-)"
-
-PHASE="$(SUMMARY_JSON="$SUMMARY_JSON" python -c 'import json, os; print(json.loads(os.environ["SUMMARY_JSON"])["phase"] or "")'
-)"
+TOTAL="$(python -m experiments.plan_status field --plan "$PLAN" --results-root "$RESULTS_ROOT" --field total)"
+DONE="$(python -m experiments.plan_status field --plan "$PLAN" --results-root "$RESULTS_ROOT" --field done)"
+PHASE="$(python -m experiments.plan_status field --plan "$PLAN" --results-root "$RESULTS_ROOT" --field phase)"
 
 if [[ -n "$PHASE_OVERRIDE" ]]; then
   PHASE="$PHASE_OVERRIDE"
@@ -54,7 +47,7 @@ fi
 
 echo "[INFO] Completed jobs: $DONE / $TOTAL"
 
-mapfile -t TODO_INDICES < <(SUMMARY_JSON="$SUMMARY_JSON" python -c 'import json, os; [print(idx) for idx in json.loads(os.environ["SUMMARY_JSON"])["todo_indices"]]')
+mapfile -t TODO_INDICES < <(python -m experiments.plan_status todo-indices --plan "$PLAN" --results-root "$RESULTS_ROOT")
 
 if [[ "${#TODO_INDICES[@]}" -eq 0 ]]; then
   echo "[INFO] No remaining jobs. Exporting reports only."
@@ -73,12 +66,7 @@ else
 
   echo "[INFO] Resuming remaining jobs..."
   for idx in "${TODO_INDICES[@]}"; do
-    JOB_DONE="$(PLAN="$PLAN" RESULTS_ROOT="$RESULTS_ROOT" JOB_INDEX="$idx" python -c 'import json, os; plan=os.environ["PLAN"]; results_root=os.environ["RESULTS_ROOT"]; job_index=int(os.environ["JOB_INDEX"]); 
-with open(plan, "r", encoding="utf-8") as f:
-    for i, line in enumerate(f):
-        if i == job_index:
-            job=json.loads(line); path=os.path.join(results_root, job["dataset"], job["job_id"], "test_results.json"); print("1" if os.path.exists(path) else "0"); break'
-)"
+    JOB_DONE="$(python -m experiments.plan_status job-done --plan "$PLAN" --results-root "$RESULTS_ROOT" --index "$idx")"
     if [[ "$JOB_DONE" == "1" ]]; then
       echo "[INFO] Skip completed job index $idx"
       continue

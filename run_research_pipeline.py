@@ -1,12 +1,17 @@
 import argparse
 import json
 import os
+from pathlib import Path
+
+from utils.runtime_temp import configure_runtime_tempdir
+
+configure_runtime_tempdir(Path(__file__).resolve().parent)
 
 from analysis.mechanism_reporting import export_mechanism_report
 from analysis.reporting import export_experiment_report, PRIMARY_REPORT_METRICS
 from data.unified_preprocessing import DatasetBuildConfig, UnifiedSequentialPreprocessor, default_raw_dir
 from experiments.job_utils import merge_nested_params
-from experiments.specs import build_experiment_plan, save_plan
+from experiments.specs import PHASES, build_experiment_plan, save_plan
 from experiments.runner import load_job_from_jsonl, run_experiment_job
 
 
@@ -28,6 +33,10 @@ def preprocess_command(args):
 
 def plan_command(args):
     base_params = _load_base_params(args.params_file, args.params_json)
+    base_params = merge_nested_params(
+        base_params,
+        _load_base_params(args.params_overlay_file, None),
+    )
     jobs = build_experiment_plan(
         phase=args.phase,
         datasets=args.datasets,
@@ -126,7 +135,7 @@ def main():
     preprocess.set_defaults(func=preprocess_command)
 
     plan = subparsers.add_parser("plan", help="Generate staged experiment jobs.")
-    plan.add_argument("--phase", choices=["backbone", "augment", "loss", "ablation", "comparison", "all"], required=True)
+    plan.add_argument("--phase", choices=list(PHASES), required=True)
     plan.add_argument("--datasets", nargs="+", default=None, help="Omit to use the phase default matrix.")
     plan.add_argument("--backbones", nargs="+", default=None, help="Omit to use the phase default matrix.")
     plan.add_argument(
@@ -145,7 +154,13 @@ def main():
             "semantic_alpha_tradeoff/semantic, semantic_hybrid, all/full, all_with_experimental."
         ),
     )
-    plan.add_argument("--seeds", nargs="+", type=int, default=[42])
+    plan.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Defaults to five final seeds for supplementary, three selection seeds for validation_reference/validation_audit, and 42 otherwise.",
+    )
     plan.add_argument(
         "--params-file",
         default=None,
@@ -155,6 +170,11 @@ def main():
         "--params-json",
         default=None,
         help="Inline JSON object with fixed parameters. Supports a flat object or scoped keys like __default__/__backbones__/__datasets__/__dataset_backbones__.",
+    )
+    plan.add_argument(
+        "--params-overlay-file",
+        default=None,
+        help="Optional higher-priority JSON overlay, including validation-selected __methods__ scopes.",
     )
     plan.add_argument("--output", default=os.path.join("experiments", "jobs.jsonl"))
     plan.set_defaults(func=plan_command)

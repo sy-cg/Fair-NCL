@@ -45,9 +45,17 @@ class Config:
         'random_low_skew': 0.8,
         'high_skew': 0.75,
         'fair_ncl': 0.75,
+        'fair_ncl_factorial': 0.75,
+        'coserec': 0.75,
         'fair_ncl_alpha_tradeoff': 0.75,
         'fair_ncl_semantic_alpha_tradeoff': 0.75,
         'fair_ncl_semantic_hybrid_alpha_tradeoff': 0.75,
+        'ncl_sr_mce': 0.75,
+        'fair_aug_mce': 0.75,
+        'skew_only_aug': 0.75,
+        'fair_aug_no_geometry': 0.75,
+        'fair_aug_no_augmented_ce': 0.75,
+        'raw_skew_fair_ncl': 0.75,
         'adv_debias': 0.75,
         'grl': 0.75,
         'sm_pcfr': 0.5,
@@ -143,15 +151,42 @@ class Config:
         self.semantic_hashing_dim = 4096
         self.bias_min_count = 5
         self.bias_smoothing = 1.0
+        self.bias_metric = "prior_jsd"
+        self.bias_event_source = "unique_train_events"
+        self.bias_prior_strength = 5.0
+        self.bias_prior_source = "interaction"
+        self.bias_unknown_score = 1.0
         self.fair_ncl_aug_rec_weight = 0.5
         self.fair_ncl_align_weight = 1.0
         self.fair_ncl_var_weight = 1.0
         self.fair_ncl_cov_weight = 0.04
+        self.ncl_objective = "vicreg"
+        self.mce_uniform_weight = 1.0
+        self.mce_align_weight = 1.0
+        self.mce_gamma = 1.0
+        self.mce_eps = 1e-4
         self.train_num_negative = 1
         self.eval_num_negative = 0
+        self.train_negative_history_only = False
+
+        # CoSeRec defaults from the bundled authors' implementation. The
+        # revision plan tunes only the contrastive weight on validation data.
+        self.coserec_cf_weight = 0.1
+        self.coserec_temperature = 1.0
+        self.coserec_crop_rate = 0.2
+        self.coserec_mask_rate = 0.7
+        self.coserec_reorder_rate = 0.2
+        self.coserec_insert_rate = 0.4
+        self.coserec_max_insert_num_per_pos = 1
+        self.coserec_substitute_rate = 0.1
+        self.coserec_short_threshold = 4
+        self.coserec_similarity_top_k = 20
 
         # 评估配置
         self.topk_list = [5, 10, 20]
+        self.export_per_user_metrics = False
+        self.report_intersectional_groups = False
+        self.evaluate_test = True
 
         # RQ4 mechanism-analysis configuration. Tuning phases disable this
         # automatically in the experiment runner unless explicitly overridden.
@@ -294,3 +329,4 @@ class Config:
                 lines.append(f"{key:30s}: {value}")
         lines.append("=" * 60)
         return '\n'.join(lines)
+
